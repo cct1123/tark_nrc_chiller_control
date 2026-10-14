@@ -1,0 +1,33 @@
+:root { font-family: "Segoe UI", sans-serif; color: #20383b; background: #f1f4f2; }
+body { margin: 0; }
+main { max-width: 1120px; margin: 42px auto; padding: 0 28px; }
+header { display: flex; align-items: center; justify-content: space-between; }
+h1 { font-size: 46px; letter-spacing: -2px; margin: 0; font-weight: 650; }
+.eyebrow { font-size: 11px; letter-spacing: 2px; color: #537273; margin: 0 0 10px; }
+.subtitle { color: #60777a; margin: 6px 0 20px; }
+.backend { background: #dce9e4; border: 1px solid #bccfc6; padding: 10px 16px;
+  border-radius: 5px; font-size: 12px; letter-spacing: 1px; }
+.identity { color: #647a7d; font-size: 13px; padding-bottom: 22px; }
+.metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+.metric, .panel { border: 1px solid #d7e1dd; background: #fff; border-radius: 8px; }
+.metric { padding: 22px; min-height: 70px; }
+.metric p { font-size: 10px; letter-spacing: 1.4px; color: #6b7c7e; margin: 0 0 16px; }
+.metric strong { font-size: 25px; font-weight: 550; color: #007d85; }
+.panel { margin-top: 20px; padding: 20px 24px; }
+.section-title { display: flex; justify-content: space-between; align-items: center; gap: 16px; }
+h2 { font-size: 16px; font-weight: 600; margin: 0 0 8px; }
+.muted { color: #6b7c7e; font-size: 12px; }
+.controls { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin: 15px 0; }
+label { font-size: 13px; }
+input, button { border: 1px solid #cbd9d3; border-radius: 4px; padding: 10px 14px;
+  font: inherit; font-size: 13px; background: #f8faf9; color: #20383b; }
+input { width: 90px; }
+button { cursor: pointer; }
+button:hover:not(:disabled) { background: #dce9e4; }
+button.primary { background: #007d85; color: white; border-color: #007d85; }
+button:disabled, input:disabled { opacity: .45; cursor: default; }
+#notice { border-top: 1px solid #e4ebe7; padding-top: 14px; font-size: 13px; }
+footer { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px;
+  margin: 20px 0; color: #6b7c7e; font-size: 11px; }
+@media (max-width: 780px) { .metrics { grid-template-columns: repeat(2, 1fr); }
+  main { margin: 24px auto; padding: 0 16px; } .section-title { flex-wrap: wrap; } }
