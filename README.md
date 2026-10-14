@@ -4,6 +4,10 @@ Python API, CLI, serial simulator, CSV recorder and local Dash dashboard for the
 Tark NRC400-T0-00-PC2. A supervised happy-path prototype; hardware commissioning
 is pending. The chiller's internal controller performs thermal regulation.
 
+<img src="docs/images/nrc400-device.png" alt="Tark Nextreme NRC400 thermoelectric chiller" width="360">
+
+Product photo: [Tark Thermal Solutions](https://tark-solutions.com/products/thermoelectric-cooler-assemblies/nextreme-thermoelectric-chillers).
+
 ## Install and try
 
 Python 3.11+, Windows PowerShell (Linux/macOS: use `.venv/bin/python`):
@@ -20,6 +24,10 @@ $nrcPython = ".\.venv\Scripts\python"
 Open <http://127.0.0.1:8050>, apply a target and press Run. Each process has its own
 simulation (12 s first-order response, 24 °C idle; not measured performance).
 CSV recording requires a new filename on every run.
+
+![NRC400 controller dashboard showing simulated temperature, setpoint, pump state and live trend](docs/images/gui-dashboard.jpg)
+
+GUI shown in simulator mode; these are not physical equipment measurements.
 
 ## Hardware and control
 
