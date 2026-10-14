@@ -2,11 +2,14 @@
 
 import math
 import time
+from dataclasses import replace
 
 from .transport import SerialSettings, SerialTransport
 
 
 class SimulatedSerial:
+    """Offline test peer with an illustrative thermal model, not measured performance."""
+
     def __init__(self, **kwargs):
         self.is_open = True
         self._buffer = bytearray()
@@ -39,6 +42,7 @@ class SimulatedSerial:
         return c if self.units == "C" else c * 1.8 + 32
 
     def write(self, payload):
+        """Apply a fixture command and queue its reply through the real serial codec."""
         self.commands.append(payload)
         now = time.monotonic()
         dt = now - self._last
@@ -72,12 +76,18 @@ class SimulatedSerial:
                 reply = "ERROR: invalid write"
         else:
             values = {
-                "MOD": "NRC400-T0-00-PC2", "SSN": "SIMULATOR-0001",
+                "MOD": "NRC400-T0-00-PC2",
+                "SSN": "SIMULATOR-0001",
                 "VER": "TEA FIRMWARE VERSION SIM-0.1",
                 "CST": f"{self._display(self.temperature_c):.2f} {self.units}",
                 "TSP": f"{self._display(self.target_c):.1f}",
-                "SCF": self.units, "CTL": self.loop, "PMP": self.pump, "LVL": self.level,
-                "COL": self.coolant, "DAT": self.date, "TIM": self.clock,
+                "SCF": self.units,
+                "CTL": self.loop,
+                "PMP": self.pump,
+                "LVL": self.level,
+                "COL": self.coolant,
+                "DAT": self.date,
+                "TIM": self.clock,
             }
             reply = values.get(command, "ERROR: unknown command")
         self._buffer.extend((reply + "\r\n").encode("ascii"))
@@ -85,15 +95,11 @@ class SimulatedSerial:
 
 
 class Simulator(SerialTransport):
+    """Explicit offline transport; never attempts to open a physical serial port."""
+
     backend = "simulator"
 
     def __init__(self, settings: SerialSettings | None = None):
-        super().__init__(settings or SerialSettings(port="SIMULATOR"), SimulatedSerial)
-
-    def open(self):
-        # SerialTransport still checks the port; simulator never opens an OS device.
-        if not self.settings.port:
-            from dataclasses import replace
-
-            self.settings = replace(self.settings, port="SIMULATOR")
-        super().open()
+        # Explicitly label the offline peer even if passed a hardware profile.
+        settings = replace(settings or SerialSettings(), port="SIMULATOR")
+        super().__init__(settings, SimulatedSerial)

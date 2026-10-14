@@ -9,6 +9,8 @@ from .controller import Identity, Sample
 
 
 class CsvRecorder:
+    """Create one exclusive CSV and flush each row so failures preserve earlier data."""
+
     def __init__(self, path: str | Path, identity: Identity, backend: str):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -26,9 +28,15 @@ class CsvRecorder:
             raise
 
     def record(self, sample: Sample | None = None, *, error: str = ""):
-        row = sample.to_dict() if sample else {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(), "backend": self._backend,
-        }
+        """Append a sample or an error with blank measurements, never cached values."""
+        row = (
+            sample.to_dict()
+            if sample
+            else {
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+                "backend": self._backend,
+            }
+        )
         self._writer.writerow(row | self._identity | {"error": error})
         self._file.flush()
         self.rows += 1
