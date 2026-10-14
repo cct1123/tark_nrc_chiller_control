@@ -1,3 +1,5 @@
+"""Literal byte framing and failure tests using an offline serial peer."""
+
 import time
 
 import pytest
@@ -24,7 +26,7 @@ class SerialPeer:
         data = bytes(self.buffer[:size])
         del self.buffer[:size]
         if not data:
-            time.sleep(.001)
+            time.sleep(0.001)
         return data
 
     def close(self):
@@ -33,7 +35,9 @@ class SerialPeer:
 
 def link_for(reply, **settings):
     peer = SerialPeer(reply)
-    link = SerialTransport(SerialSettings(port="TEST", timeout_s=.02, **settings), lambda **kw: peer)
+    link = SerialTransport(
+        SerialSettings(port="TEST", timeout_s=0.02, **settings), lambda **kw: peer
+    )
     link.open()
     return link, peer
 
@@ -76,6 +80,24 @@ def test_explicit_no_write_reply_mode():
     assert link.request("TSP") == "20.0"
 
 
+@pytest.mark.parametrize("reply", [b"ERROR: rejected\n", b"\xff\n", b"partial"])
+def test_optional_write_reply_does_not_discard_errors_or_partial_frames(reply):
+    link, peer = link_for(reply, write_response=False, write_delay_s=0.02)
+    with pytest.raises(CommunicationError, match="may have applied"):
+        link.request("TSP", "12.0")
+    with pytest.raises(CommunicationError, match="reconnect"):
+        link.request("TSP")
+    assert peer.frames == [b"$PCTSP,12.0\r\n"]
+
+
+def test_optional_write_reply_is_consumed_before_readback():
+    link, peer = link_for(b"OK\n", write_response=False, write_delay_s=0.02)
+    assert link.request("TSP", "12.0") == "OK"
+    assert not peer.buffer
+    peer.reply = b"Coolant Supply Temp Setpoint 12.000000 C\n"
+    assert link.request("TSP") == "Coolant Supply Temp Setpoint 12.000000 C"
+
+
 @pytest.mark.parametrize("data", ["", "20\r$PCCTL,R", "20,30", "$PCCTL", "20\n"])
 def test_data_cannot_inject_second_command(data):
     with pytest.raises(ValueError):
@@ -89,7 +111,12 @@ def test_actual_serial_open_parameters_and_lazy_construction():
     assert not calls
     link.open()
     settings = calls[0]
-    assert (settings["baudrate"], settings["bytesize"], settings["parity"], settings["stopbits"]) == (115200, 8, "N", 1)
+    assert (
+        settings["baudrate"],
+        settings["bytesize"],
+        settings["parity"],
+        settings["stopbits"],
+    ) == (115200, 8, "N", 1)
     assert not any(settings[k] for k in ["xonxoff", "rtscts", "dsrdtr"])
 
 
@@ -98,3 +125,18 @@ def test_partial_serial_write_is_failure(monkeypatch):
     monkeypatch.setattr(peer, "write", lambda payload: 2)
     with pytest.raises(CommunicationError, match="Incomplete"):
         link.request("TSP", "20.0")
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"port": True},
+        {"port": 7},
+        {"port": None},
+        {"timeout_s": True},
+        {"write_delay_s": False},
+    ],
+)
+def test_serial_settings_reject_implicit_port_numbers_and_boolean_timings(settings):
+    with pytest.raises(ValueError):
+        SerialSettings(**settings)

@@ -1,3 +1,5 @@
+"""Offline controller validation, control guards and write/readback checks."""
+
 import math
 
 import pytest
@@ -45,7 +47,7 @@ def test_celsius_api_with_fahrenheit_front_panel(chiller):
     assert chiller.read_sample().device_units == "F"
 
 
-@pytest.mark.parametrize("value", [-5, 0, 9.9, 40.1, 50, math.nan, math.inf, True])
+@pytest.mark.parametrize("value", [-5, 0, 9.9, 40.1, 50, math.nan, math.inf, True, None, "", "abc"])
 def test_invalid_target_never_writes(chiller, value):
     peer = chiller.transport._serial
     before = list(peer.commands)
@@ -54,10 +56,17 @@ def test_invalid_target_never_writes(chiller, value):
     assert peer.commands == before
 
 
-@pytest.mark.parametrize("action", [
-    lambda c: c.set_setpoint(20), lambda c: c.run(), lambda c: c.stop(),
-    lambda c: c.set_pump(True), lambda c: c.set_units("F"), lambda c: c.set_time("12:00:00"),
-])
+@pytest.mark.parametrize(
+    "action",
+    [
+        lambda c: c.set_setpoint(20),
+        lambda c: c.run(),
+        lambda c: c.stop(),
+        lambda c: c.set_pump(True),
+        lambda c: c.set_units("F"),
+        lambda c: c.set_time("12:00:00"),
+    ],
+)
 def test_read_only_actions_never_send_write(action):
     with Chiller(Simulator()) as device:
         with pytest.raises(PermissionError):
@@ -115,6 +124,32 @@ def test_model_mismatch_closes_connection(monkeypatch):
 def test_display_units_changed_during_sample(chiller, monkeypatch):
     original = chiller.query
     checks = iter(["C", "F"])
-    monkeypatch.setattr(chiller, "query", lambda code: next(checks) if code == "SCF" else original(code))
+    monkeypatch.setattr(
+        chiller, "query", lambda code: next(checks) if code == "SCF" else original(code)
+    )
     with pytest.raises(ProtocolError, match="units changed"):
         chiller.read_sample()
+
+
+def test_explicit_reconnect_resets_uncertain_write_guard(chiller, monkeypatch):
+    original = chiller.read_setpoint
+    monkeypatch.setattr(chiller, "read_setpoint", lambda: 22)
+    with pytest.raises(ProtocolError):
+        chiller.set_setpoint(21)
+    monkeypatch.setattr(chiller, "read_setpoint", original)
+    chiller.close()
+    chiller.connect()
+    assert chiller.set_setpoint(21) == 21
+
+
+def test_interrupted_readback_also_blocks_future_writes(chiller, monkeypatch):
+    def interrupt():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(chiller, "read_setpoint", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        chiller.set_setpoint(21)
+    before = list(chiller.transport._serial.commands)
+    with pytest.raises(ProtocolError, match="Previous write unverified"):
+        chiller.set_units("F")
+    assert chiller.transport._serial.commands == before

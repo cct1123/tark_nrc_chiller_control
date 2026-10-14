@@ -21,6 +21,8 @@ class ProtocolError(RuntimeError):
 
 @dataclass(frozen=True)
 class SerialSettings:
+    """Verified port name and finite transaction timings; no automatic port discovery."""
+
     port: str = ""
     timeout_s: float = 1.0
     line_ending: str = "crlf"
@@ -28,17 +30,28 @@ class SerialSettings:
     write_delay_s: float = 0.1
 
     def __post_init__(self):
+        if not isinstance(self.port, str):
+            raise ValueError("port must be a string naming the verified serial device")
         if self.line_ending not in ENDINGS:
             raise ValueError("line_ending must be cr, lf or crlf")
-        if not math.isfinite(self.timeout_s) or not 0 < self.timeout_s <= 30:
+        if (
+            isinstance(self.timeout_s, bool)
+            or not math.isfinite(self.timeout_s)
+            or not 0 < self.timeout_s <= 30
+        ):
             raise ValueError("timeout_s must be greater than 0 and at most 30")
-        if not math.isfinite(self.write_delay_s) or not 0 <= self.write_delay_s <= 5:
+        if (
+            isinstance(self.write_delay_s, bool)
+            or not math.isfinite(self.write_delay_s)
+            or not 0 <= self.write_delay_s <= 5
+        ):
             raise ValueError("write_delay_s must be between 0 and 5")
         if type(self.write_response) is not bool:
             raise ValueError("write_response must be a boolean")
 
 
 def encode_command(command: str, data: str | None, ending: str) -> bytes:
+    """Frame one ASCII query/write and reject delimiters that could inject commands."""
     if command not in COMMANDS:
         raise ValueError(f"Unknown NRC400 command: {command}")
     if data is not None:
@@ -62,6 +75,7 @@ class SerialTransport:
         self._faulted = False
 
     def open(self):
+        """Open the selected OS port at 115200 8N1 without flow control."""
         if self._serial is not None:
             raise RuntimeError("Already connected; close before reconnecting")
         if not self.settings.port:
@@ -72,10 +86,16 @@ class SerialTransport:
 
             factory = serial.Serial
         self._serial = factory(
-            port=self.settings.port, baudrate=115200, bytesize=8, parity="N", stopbits=1,
+            port=self.settings.port,
+            baudrate=115200,
+            bytesize=8,
+            parity="N",
+            stopbits=1,
             timeout=min(0.05, self.settings.timeout_s),
             write_timeout=self.settings.timeout_s,
-            xonxoff=False, rtscts=False, dsrdtr=False,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
         )
         self._faulted = False
 
@@ -87,6 +107,12 @@ class SerialTransport:
                 self._serial = None
 
     def request(self, command: str, data: str | None = None) -> str:
+        """Send once and consume a framed reply; a raw write does not verify device state.
+
+        Queries require a reply. Explicit optional-write mode observes replies for
+        write_delay_s, accepting silence but rejecting errors or incomplete frames.
+        Use Chiller's public control methods for validated setting/readback pairs.
+        """
         payload = encode_command(command, data, self.settings.line_ending)
         if self._serial is None or self._faulted:
             raise CommunicationError("Disconnected or failed transaction; close and reconnect")
@@ -95,10 +121,9 @@ class SerialTransport:
             log.debug("TX %r", payload)
             if self._serial.write(payload) != len(payload):
                 raise CommunicationError("Incomplete serial write")
-            if data is not None and not self.settings.write_response:
-                time.sleep(self.settings.write_delay_s)
-                return ""
-            deadline = time.monotonic() + self.settings.timeout_s
+            optional_reply = data is not None and not self.settings.write_response
+            wait_s = self.settings.write_delay_s if optional_reply else self.settings.timeout_s
+            deadline = time.monotonic() + wait_s
             line = bytearray()
             while time.monotonic() < deadline:
                 byte = self._serial.read(1)
@@ -116,6 +141,8 @@ class SerialTransport:
                 line.extend(byte)
                 if len(line) > 512:
                     raise ProtocolError("Serial response exceeded 512 bytes")
+            if optional_reply and not line:
+                return ""
             raise CommunicationError(f"{command}: no complete CR/LF-terminated reply")
         except (OSError, UnicodeError, RuntimeError) as exc:
             self._faulted = True

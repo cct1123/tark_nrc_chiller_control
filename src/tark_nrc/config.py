@@ -3,10 +3,13 @@
 import tomllib
 from pathlib import Path
 
-from . import Chiller, SerialSettings, SerialTransport, Simulator
+from .controller import Chiller
+from .simulator import Simulator
+from .transport import SerialSettings, SerialTransport
 
 
 def create_chiller(config_path=None, *, simulate=False, port=None, allow_writes=False):
+    """Build an unopened controller; explicit CLI options override TOML settings."""
     config = {}
     if config_path is not None:
         with Path(config_path).open("rb") as stream:
@@ -16,7 +19,7 @@ def create_chiller(config_path=None, *, simulate=False, port=None, allow_writes=
         raise ValueError(f"Unknown configuration sections: {sorted(unknown)}")
     serial_config = dict(config.get("serial", {}))
     control = dict(config.get("control", {}))
-    if set(control) - {"allow_writes", "min_c", "max_c"}:
+    if set(control) - {"allow_writes", "min_c", "max_c", "expected_serial_number"}:
         raise ValueError("Unknown control setting")
     if port is not None:
         serial_config["port"] = port

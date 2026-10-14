@@ -1,13 +1,14 @@
 # Copy to config.toml and enter the verified OS port. See docs/commissioning.md.
 [serial]
-port = "COM3"
+port = ""  # Enter the verified port; examples are not device identification.
 timeout_s = 1.0
 # CRLF and a one-line write reply are assumptions, not specified in manual Rev 02.
 line_ending = "crlf"  # cr, lf or crlf
 write_response = true
-write_delay_s = 0.1  # Used only when write_response = false
+write_delay_s = 0.1  # Optional-reply observation window when write_response = false.
 
 [control]
 allow_writes = false
 min_c = 10.0
 max_c = 40.0
+# expected_serial_number = ""  # Optional exact SSN binding; fill before uncommenting.

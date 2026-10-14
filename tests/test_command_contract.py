@@ -1,6 +1,7 @@
 """Literal manual command bodies; framing and replies are fixtures, not bench evidence."""
 
 from collections import deque
+from dataclasses import replace
 
 import pytest
 
@@ -8,8 +9,10 @@ from tark_nrc import Chiller, ProtocolError, SerialSettings, SerialTransport
 
 
 def exchanges(transcript):
-    return [(body.encode("ascii") + b"\r\n", reply.encode("ascii") + b"\r\n")
-            for body, reply in (line.split("=", 1) for line in transcript.splitlines())]
+    return [
+        (body.encode("ascii") + b"\r\n", reply.encode("ascii") + b"\r\n")
+        for body, reply in (line.split("=", 1) for line in transcript.splitlines())
+    ]
 
 
 class ScriptedSerial:
@@ -68,17 +71,20 @@ def test_all_manual_queries_against_literal_wire_contract(transcript):
     assert not peer.exchanges
 
 
-@pytest.mark.parametrize("method,args,transcript", [
-    ("run", (), "$PCLVL=OK\n$PCCTL,R=ACCEPTED\n$PCCTL=R"),
-    ("stop", (), "$PCCTL,S=ACCEPTED\n$PCCTL=S"),
-    ("set_pump", (True,), "$PCCTL=S\n$PCLVL=OK\n$PCPMP,ON=ACCEPTED\n$PCPMP=ON"),
-    ("set_pump", (False,), "$PCCTL=S\n$PCPMP,OFF=ACCEPTED\n$PCPMP=OFF"),
-    ("set_units", ("C",), "$PCSCF,C=ACCEPTED\n$PCSCF=C"),
-    ("set_units", ("F",), "$PCSCF,F=ACCEPTED\n$PCSCF=F"),
-    ("set_setpoint", (20.0,), "$PCSCF=C\n$PCTSP,20.0=ACCEPTED\n$PCSCF=C\n$PCTSP=20.0"),
-    ("set_setpoint", (20.0,), "$PCSCF=F\n$PCTSP,68.0=ACCEPTED\n$PCSCF=F\n$PCTSP=68.0 F"),
-    ("set_time", ("18:30:00",), "$PCTIM,18:30:00=ACCEPTED\n$PCTIM=18:30:00"),
-])
+@pytest.mark.parametrize(
+    "method,args,transcript",
+    [
+        ("run", (), "$PCLVL=OK\n$PCCTL,R=ACCEPTED\n$PCCTL=R"),
+        ("stop", (), "$PCCTL,S=ACCEPTED\n$PCCTL=S"),
+        ("set_pump", (True,), "$PCCTL=S\n$PCLVL=OK\n$PCPMP,ON=ACCEPTED\n$PCPMP=ON"),
+        ("set_pump", (False,), "$PCCTL=S\n$PCPMP,OFF=ACCEPTED\n$PCPMP=OFF"),
+        ("set_units", ("C",), "$PCSCF,C=ACCEPTED\n$PCSCF=C"),
+        ("set_units", ("F",), "$PCSCF,F=ACCEPTED\n$PCSCF=F"),
+        ("set_setpoint", (20.0,), "$PCSCF=C\n$PCTSP,20.0=ACCEPTED\n$PCSCF=C\n$PCTSP=20.0"),
+        ("set_setpoint", (20.0,), "$PCSCF=F\n$PCTSP,68.0=ACCEPTED\n$PCSCF=F\n$PCTSP=68.0 F"),
+        ("set_time", ("18:30:00",), "$PCTIM,18:30:00=ACCEPTED\n$PCTIM=18:30:00"),
+    ],
+)
 def test_control_actions_send_correct_fields_and_query_readback(method, args, transcript):
     device, peer = scripted_device(transcript)
     with device:
@@ -102,11 +108,63 @@ def test_time_write_rejects_wrong_or_malformed_readback_without_replay(reply):
     assert peer.sent.count(b"$PCTIM,18:30:00\r\n") == 1
 
 
-@pytest.mark.parametrize("requested,reported", [
-    ("18:30:00", "18:30:01"), ("23:59:59", "00:00:00"),
-])
+@pytest.mark.parametrize(
+    "requested,reported",
+    [
+        ("18:30:00", "18:30:01"),
+        ("23:59:59", "00:00:00"),
+    ],
+)
 def test_time_readback_allows_clock_tick_and_midnight(requested, reported):
     device, peer = scripted_device(f"$PCTIM,{requested}=OK\n$PCTIM={reported}")
     with device:
         assert device.set_time(requested) == reported
     assert not peer.exchanges
+
+
+@pytest.mark.parametrize(
+    "method,args,transcript",
+    [
+        ("run", (), "$PCLVL=OK\n$PCCTL,R=OK\n$PCCTL=S"),
+        ("stop", (), "$PCCTL,S=OK\n$PCCTL=UNKNOWN"),
+        ("set_pump", (True,), "$PCCTL=S\n$PCLVL=OK\n$PCPMP,ON=OK\n$PCPMP=OFF"),
+        ("set_units", ("F",), "$PCSCF,F=OK\n$PCSCF=C"),
+        ("set_setpoint", (20.0,), "$PCSCF=C\n$PCTSP,20.0=OK\n$PCSCF=C\n$PCTSP=21.0"),
+        ("set_time", ("18:30:00",), "$PCTIM,18:30:00=OK\n$PCTIM=12:00:00"),
+    ],
+)
+def test_every_control_readback_failure_blocks_following_writes(method, args, transcript):
+    device, peer = scripted_device(transcript + "\n$PCMOD=NRC400")
+    with device:
+        with pytest.raises(ProtocolError):
+            getattr(device, method)(*args)
+        before = list(peer.sent)
+        with pytest.raises(ProtocolError, match="Previous write unverified"):
+            device.set_units("F")
+        assert peer.sent == before
+        assert device.query("MOD") == "NRC400"  # Read-only diagnosis remains available.
+    assert sum(b"," in frame for frame in peer.sent) == 1
+
+
+def test_stop_accepts_plain_running_transition_without_resending():
+    device, peer = scripted_device("$PCCTL,S=OK\n$PCCTL=R\n$PCCTL=S")
+    with device:
+        device.stop()
+    assert peer.sent.count(b"$PCCTL,S\r\n") == 1
+
+
+def test_stop_deadline_does_not_issue_another_query_or_write(monkeypatch):
+    # Advance a controlled clock on sleep; wall-clock scheduling is not the contract.
+    clock = [0.0]
+    monkeypatch.setattr("tark_nrc.controller.time.monotonic", lambda: clock[0])
+
+    def advance(seconds):
+        clock[0] += seconds
+
+    monkeypatch.setattr("tark_nrc.controller.time.sleep", advance)
+    device, peer = scripted_device("$PCCTL,S=OK\n$PCCTL=R")
+    device.transport.settings = replace(device.transport.settings, timeout_s=0.01)
+    with device, pytest.raises(ProtocolError, match="Stop readback"):
+        device.stop()
+    assert peer.sent.count(b"$PCCTL,S\r\n") == 1
+    assert peer.sent.count(b"$PCCTL\r\n") == 1
