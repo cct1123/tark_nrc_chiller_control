@@ -1,7 +1,9 @@
 # Physical commissioning
 
 Follow the full [manufacturer manual](sources/README.md) for the fitted unit.
-No physical acceptance has been performed; record evidence below.
+Partial hardware checks were performed on 2026-10-14; see
+[the recorded results and limits](hardware-session-2026-10-14.md). Complete
+physical acceptance requires the remaining evidence below.
 
 ## Installation
 
@@ -56,4 +58,6 @@ unit identity/firmware; coolant/panel setting/target limits; plumbing/prime/leak
 clearance; mains/ground/adapter/cable; framing/latency/timeout/write reply/delay;
 panel comparisons; target persistence/C/F; pump/loop/fan behavior; calibration/
 settling/load-ambient capacity; independent protection; alarms/link-loss recovery.
-All items remain pending until documented. Software tests are not bench acceptance.
+Mark each item separately when documented; the session report identifies the
+completed communication/control checks and remaining physical limits. Software
+tests are not bench acceptance.

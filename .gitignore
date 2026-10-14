@@ -9,4 +9,5 @@ build/
 dist/
 tmp/
 outputs/
+config.toml
 docs/sources/*.pdf
