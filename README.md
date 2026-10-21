@@ -11,22 +11,22 @@ Python 3.11 or newer is required. From the repository root:
 ```powershell
 python -m pip install .
 tark-nrc --simulate read
-tark-nrc --simulate --allow-writes gui
+tark-nrc --simulate gui
 ```
 
 Alternatively, with [uv](https://docs.astral.sh/uv/):
 
 ```powershell
 uv sync
-uv run tark-nrc --simulate --allow-writes gui
+uv run tark-nrc --simulate gui
 ```
 
 Open <http://127.0.0.1:8057> and press **Connect**. The dashboard starts
-disconnected. Apply a setpoint, then press **Run**. **Stop loop** and **Pump off**
-are separate actions. **Shut down GUI** closes the connection and local server;
-the chiller retains its loop and pump state.
-
-![Dashboard in simulator mode; values are not equipment measurements](docs/images/gui-dashboard.jpg)
+disconnected. Apply a setpoint, then press **Run loop**; the same button becomes
+**Stop loop** when running. A separate pump button switches between **Pump on**
+and **Pump off**. Labels follow device readings and name the action a click sends.
+**Shut down GUI** closes the connection and local server; the chiller retains its
+loop and pump state.
 
 Simulation never opens a hardware port. Each process has a separate simulated
 device with an illustrative 12-second response and 24 °C idle temperature.
@@ -34,7 +34,7 @@ device with an illustrative 12-second response and 24 °C idle temperature.
 ## Connect hardware
 
 Follow [commissioning](docs/commissioning.md), copy `config.example.toml` to
-`config.toml`, and enter the verified serial port. Start with writes disabled:
+`config.toml`, and enter the verified serial port. Check identity and readings:
 
 ```powershell
 tark-nrc ports
@@ -44,9 +44,9 @@ tark-nrc gui
 ```
 
 The GUI loads `config.toml` from the current directory unless `--config` or an
-explicit backend is supplied. Enable `control.allow_writes` only after checking
-the connection and physical setup. `--allow-writes` also enables controls for
-that invocation. Hardware selection never falls back to simulation.
+explicit backend is supplied. All controls become available after Connect;
+there is no write-enable flag or read-only session. Hardware selection never
+falls back to simulation.
 
 The link uses 115200 baud, 8N1, without flow control. Configure verified line
 endings, timeouts and write replies for your unit. Optionally bind
@@ -55,24 +55,33 @@ endings, timeouts and write replies for your unit. Optionally bind
 adapter selection. Your local configuration is excluded from Git.
 
 All API temperatures are Celsius, including when the panel displays Fahrenheit.
-Default setpoint limits are 10–40 °C; configure limits for the actual coolant and
-firmware. Setting methods send once and verify readback. An uncertain write
-blocks further writes until explicit close/reconnect; inspect the panel first.
-Run checks coolant level, and pump-only changes require a stopped loop.
+The application imposes no setpoint window, coolant-level prerequisite or loop-state
+prerequisite. Users choose actions directly; the device decides which commands it
+accepts. Commands are sent once and readback is checked. Errors are shown without
+permanently locking later actions; commands are never replayed automatically.
 
-The dashboard retains 600 samples and stops polling on communication or recording
-failure. Activation remains locked after a fault; explicit **Stop loop** or
-**Pump off** can reconnect to the same unit for verified deactivation. Restart
-before other actions. Use the front panel if communication fails. Serial status
-does not establish physical flow, cooling or a complete alarm state.
+The dashboard retains 600 samples. `CTL=QUIT` is retained as a firmware status
+and does not disable controls. A device rejection or mismatched readback remains
+visible while later commands stay available. A CSV error stops recording while
+readings and controls continue. A framing/connection failure closes the port;
+press **Connect** to reopen it without restarting the app. Closing or reconnecting
+sends no control commands.
+
+The `[control]` section now contains only the optional `expected_serial_number`.
+Remove obsolete `allow_writes`, `min_c` and `max_c` keys from older profiles.
 
 ## Python API and recording
+
+For guided hardware runs, see the [standalone tutorial scripts and notebooks](examples/README.md).
+They cover discovery, panel comparisons, confirmed target changes, CSV recording,
+connection timing, separate loop/pump controls and the local dashboard, with a
+hardware test record checklist and an explicit offline rehearsal option.
 
 ```python
 from tark_nrc import CsvRecorder, create_chiller
 
-# Use create_chiller("config.toml") for read-only hardware access.
-with create_chiller(simulate=True, allow_writes=True) as chiller:
+# Use create_chiller("config.toml") for hardware access.
+with create_chiller(simulate=True) as chiller:
     print(chiller.identity)
     chiller.set_setpoint(20.0)
     chiller.run()
@@ -122,9 +131,9 @@ For the dashboard, start at `gui.create_app()`. Its nested `update()` callback
 chooses the requested action and calls `DashboardSession.refresh()`. The session
 performs the action, reads fresh state, checks the result, and saves it to history
 and optional CSV. The callback then puts those values on the page. Button clicks
-request actions; current device readings determine whether buttons are enabled.
+request actions; the connection state determines whether buttons are enabled.
 When adding a control, keep `CONTROLS`, the callback arguments/outputs,
-`_apply_action()` and `disabled_controls()` in agreement.
+`_apply_action()` and the returned display values in agreement.
 
 | Change you want to make | Start here | Relevant tests |
 |---|---|---|
@@ -137,9 +146,9 @@ Three details matter when editing control code:
 
 - `with chiller:` connects and closes the port; closing does not stop equipment.
   `with CsvRecorder(...):` closes only the CSV file.
-- `Chiller._verified_write()` sends once, then runs the caller's readback checks
-  inside the `with` block. A failure, including Ctrl+C, blocks later writes because
-  the equipment may already have changed. Keep device writes in `Chiller` methods.
+- Setting methods send once, then check readback. Errors report an unconfirmed
+  result without replaying the command or locking later user actions. Keep device
+  writes and readback checks together in `Chiller` methods.
 - The `RLock` allows a method holding the lock to call another method on the same
   object. It keeps an entire read/control operation together; it starts no thread.
 
@@ -153,8 +162,8 @@ Development tools are optional:
 ```powershell
 uv sync --group dev
 uv run --group dev pytest
-uv run --group dev ruff check src tests
-uv run --group dev ruff format --check src tests
+uv run --group dev ruff check src tests examples
+uv run --group dev ruff format --check src tests examples
 uv build
 ```
 

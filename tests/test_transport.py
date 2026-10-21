@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tark_nrc import CommunicationError, SerialSettings, SerialTransport
+from tark_nrc import CommunicationError, ProtocolError, SerialSettings, SerialTransport
 from tark_nrc.controller import encode_command
 
 
@@ -56,7 +56,7 @@ def test_bare_response_and_echo(reply):
     assert link.request("CST") == "25.38 C"
 
 
-@pytest.mark.parametrize("reply", [b"", b"25.38 C", b"\xff\n", b"x" * 513 + b"\n", b"ERROR: bad\n"])
+@pytest.mark.parametrize("reply", [b"", b"25.38 C", b"\xff\n", b"x" * 513 + b"\n"])
 def test_failed_exchange_blocks_following_request(reply):
     link, peer = link_for(reply)
     with pytest.raises(CommunicationError):
@@ -81,7 +81,7 @@ def test_explicit_no_write_reply_mode():
     assert link.request("TSP") == "20.0"
 
 
-@pytest.mark.parametrize("reply", [b"ERROR: rejected\n", b"\xff\n", b"partial"])
+@pytest.mark.parametrize("reply", [b"\xff\n", b"partial"])
 def test_optional_write_reply_does_not_discard_errors_or_partial_frames(reply):
     link, peer = link_for(reply, write_response=False, write_delay_s=0.02)
     with pytest.raises(CommunicationError, match="may have applied"):
@@ -207,3 +207,13 @@ def test_partial_serial_write_is_failure(monkeypatch):
 def test_serial_settings_reject_implicit_port_numbers_and_boolean_timings(settings):
     with pytest.raises(ValueError):
         SerialSettings(**settings)
+
+
+@pytest.mark.parametrize("write_response", [True, False])
+def test_complete_device_rejection_does_not_block_next_request(write_response):
+    link, peer = link_for(b"ERROR: rejected\n", write_response=write_response, write_delay_s=0.02)
+    with pytest.raises(ProtocolError, match="device rejected"):
+        link.request("PMP", "OFF")
+    peer.reply = b"S\n"
+    assert link.request("CTL") == "S"
+    assert peer.frames == [b"$PCPMP,OFF\r\n", b"$PCCTL\r\n"]

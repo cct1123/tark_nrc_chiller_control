@@ -39,7 +39,7 @@ supply only. Provide suitable independent heat-source thermal/flow protection.
    port. Disable heat load initially and close competing serial programs.
 2. In a terminal at 115200 8N1/no flow control, query MOD, VER and CST. Capture
    command/reply endings and latency; finish outstanding requests before changing endings.
-3. Enter verified framing/timeout in `config.toml`; keep writes disabled. Run
+3. Enter verified framing/timeout in `config.toml`; use query commands first. Run
    `--config config.toml --verbose identify`, then `read`.
 4. Compare all identity, temperature/target, units, pump/loop, level and coolant
    readings with the panel. Record ten minutes of CSV; check timestamps/values/gaps.
@@ -48,7 +48,7 @@ supply only. Provide suitable independent heat-source thermal/flow protection.
 
 ## Controlled writes
 
-Enable writes only with verified communication and a filled/primed circuit;
+Before issuing control commands, verify communication and a filled/primed circuit;
 supervise the first actions at the panel.
 
 1. Try a modest approved target change, e.g. 20 to 21 °C. Capture write reply and
@@ -59,7 +59,7 @@ supervise the first actions at the panel.
 3. Stop the loop; record pump/fan behavior. Use separate pump-off when appropriate
    for the experiment. Confirm C/F behavior without changing the physical target.
 4. Disconnect the serial link while supervised; record retained operation/recovery.
-   Reconnect read-only; no command should be replayed.
+   Reconnect and query state; no command should be replayed.
 5. Use vendor-permitted procedures for alarms/interlocks. Do not create faults by
    starving/blocking the pump. Validate independent return-temperature/flow protection.
 

@@ -11,7 +11,4 @@ write_response = true
 write_delay_s = 0.1  # Optional-reply observation window when write_response = false.
 
 [control]
-allow_writes = false
-min_c = 10.0
-max_c = 40.0
 # expected_serial_number = ""  # Optional exact SSN binding; fill before uncommenting.

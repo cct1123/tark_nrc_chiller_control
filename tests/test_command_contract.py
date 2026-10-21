@@ -45,7 +45,7 @@ def scripted_device(transcript):
     identity = "$PCMOD=NRC400-T0-00-PC2\n$PCSSN=TEST-SERIAL\n$PCVER=TEA FIRMWARE VERSION TEST\n"
     peer = ScriptedSerial(identity + transcript)
     link = SerialTransport(SerialSettings(port="SCRIPTED"), lambda **kw: peer)
-    return Chiller(link, allow_writes=True), peer
+    return Chiller(link), peer
 
 
 QUERIES = """$PCCOL=20
@@ -74,10 +74,10 @@ def test_all_manual_queries_against_literal_wire_contract(transcript):
 @pytest.mark.parametrize(
     "method,args,transcript",
     [
-        ("run", (), "$PCLVL=OK\n$PCCTL,R=ACCEPTED\n$PCCTL=R"),
+        ("run", (), "$PCCTL,R=ACCEPTED\n$PCCTL=R"),
         ("stop", (), "$PCCTL,S=ACCEPTED\n$PCCTL=S"),
-        ("set_pump", (True,), "$PCCTL=S\n$PCLVL=OK\n$PCPMP,ON=ACCEPTED\n$PCPMP=ON"),
-        ("set_pump", (False,), "$PCCTL=S\n$PCPMP,OFF=ACCEPTED\n$PCPMP=OFF"),
+        ("set_pump", (True,), "$PCPMP,ON=ACCEPTED\n$PCPMP=ON"),
+        ("set_pump", (False,), "$PCPMP,OFF=ACCEPTED\n$PCPMP=OFF"),
         ("set_units", ("C",), "$PCSCF,C=ACCEPTED\n$PCSCF=C"),
         ("set_units", ("F",), "$PCSCF,F=ACCEPTED\n$PCSCF=F"),
         ("set_setpoint", (20.0,), "$PCSCF=C\n$PCTSP,20.0=ACCEPTED\n$PCSCF=C\n$PCTSP=20.0"),
@@ -125,25 +125,22 @@ def test_time_readback_allows_clock_tick_and_midnight(requested, reported):
 @pytest.mark.parametrize(
     "method,args,transcript",
     [
-        ("run", (), "$PCLVL=OK\n$PCCTL,R=OK\n$PCCTL=S"),
+        ("run", (), "$PCCTL,R=OK\n$PCCTL=S"),
         ("stop", (), "$PCCTL,S=OK\n$PCCTL=UNKNOWN"),
-        ("set_pump", (True,), "$PCCTL=S\n$PCLVL=OK\n$PCPMP,ON=OK\n$PCPMP=OFF"),
+        ("set_pump", (True,), "$PCPMP,ON=OK\n$PCPMP=OFF"),
         ("set_units", ("F",), "$PCSCF,F=OK\n$PCSCF=C"),
         ("set_setpoint", (20.0,), "$PCSCF=C\n$PCTSP,20.0=OK\n$PCSCF=C\n$PCTSP=21.0"),
         ("set_time", ("18:30:00",), "$PCTIM,18:30:00=OK\n$PCTIM=12:00:00"),
     ],
 )
-def test_every_control_readback_failure_blocks_following_writes(method, args, transcript):
-    device, peer = scripted_device(transcript + "\n$PCMOD=NRC400")
+def test_every_control_readback_failure_allows_the_next_explicit_write(method, args, transcript):
+    device, peer = scripted_device(transcript + "\n$PCSCF,F=OK\n$PCSCF=F\n$PCMOD=NRC400")
     with device:
         with pytest.raises(ProtocolError):
             getattr(device, method)(*args)
-        before = list(peer.sent)
-        with pytest.raises(ProtocolError, match="Previous write unverified"):
-            device.set_units("F")
-        assert peer.sent == before
+        device.set_units("F")
         assert device.query("MOD") == "NRC400"  # Read-only diagnosis remains available.
-    assert sum(b"," in frame for frame in peer.sent) == 1
+    assert sum(b"," in frame for frame in peer.sent) == 2
 
 
 def test_stop_accepts_plain_running_transition_without_resending():
@@ -164,7 +161,7 @@ def test_stop_deadline_does_not_issue_another_query_or_write(monkeypatch):
     monkeypatch.setattr("tark_nrc.controller.time.sleep", advance)
     device, peer = scripted_device("$PCCTL,S=OK\n$PCCTL=R")
     device.transport.settings = replace(device.transport.settings, timeout_s=0.01)
-    with device, pytest.raises(ProtocolError, match="Stop readback"):
+    with device, pytest.raises(ProtocolError, match="last CTL readback was 'R'"):
         device.stop()
     assert peer.sent.count(b"$PCCTL,S\r\n") == 1
     assert peer.sent.count(b"$PCCTL\r\n") == 1

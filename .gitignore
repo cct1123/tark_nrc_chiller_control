@@ -1,14 +1,28 @@
 .venv/
-.uv-cache/
+
+# Generated caches and temporary files, at any depth.
 __pycache__/
+.ipynb_checkpoints/
 *.py[cod]
-.pytest_cache/
+cache/
+caches/
+.cache/
+*_cache/
+.*-cache/
 pytest-cache-files-*/
-.ruff_cache/
+pytest-of-*/
+tmp/
+temp/
+.tmp/
+.temp/
+*.tmp
+*.temp
+*~
+
+# Build products and local hardware data.
 *.egg-info/
 build/
 dist/
-tmp/
 outputs/
 config.toml
 docs/sources/*.pdf

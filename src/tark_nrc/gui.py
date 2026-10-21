@@ -15,15 +15,21 @@ from collections import deque
 from dataclasses import asdict
 from threading import RLock, Thread
 
-from .controller import COMMANDS, Chiller, CsvRecorder, ProtocolError, create_chiller, finite_number
+from .controller import (
+    COMMANDS,
+    Chiller,
+    CommunicationError,
+    CsvRecorder,
+    ProtocolError,
+    create_chiller,
+    finite_number,
+)
 
 # Keep this order aligned with update()'s button arguments and callback outputs.
 CONTROLS = {
     "set": "Apply setpoint",
-    "run": "Run",
-    "stop": "Stop loop",
-    "pump-on": "Pump on",
-    "pump-off": "Pump off",
+    "loop": "Run loop",
+    "pump": "Pump on",
 }
 
 
@@ -34,9 +40,10 @@ class DashboardSession:
     action and returns (sample, message) for the page; sample=None means there is
     no current reading. shutdown() closes resources without stopping equipment.
 
-    failed stays True after a communication/readback/CSV fault. Only an explicit
-    Stop/Pump off may reconnect for deactivation; other actions need an app restart.
-    closed means the GUI has shut down and no further connection/action is allowed.
+    All controls are available while connected, regardless of reported state.
+    failed records the latest request error, not a permanent action lock. A broken
+    serial link closes the connection; Connect can reopen it without restarting.
+    closed means the user shut down the GUI. Recording errors do not block control.
     """
 
     def __init__(self, chiller: Chiller, recorder=None, *, csv_path=None):
@@ -46,6 +53,7 @@ class DashboardSession:
         self.csv_path = csv_path
         self.history = deque(maxlen=600)
         self.failed = False
+        self.recording_error = ""
         self.closed = False
         self.message = (
             "Reading the chiller…" if chiller.identity else "Disconnected. Press Connect."
@@ -54,13 +62,14 @@ class DashboardSession:
         self._lock = RLock()
 
     def connect(self):
-        """Connect on operator request using queries only; faults still require restart."""
+        """Connect or reconnect on request, using identity queries only."""
         with self._lock:
-            if self.closed or self.failed:
+            if self.closed:
                 return None, self.message
-            if self.chiller.identity is not None:
+            if self.chiller.identity is not None and not self.failed:
                 return self.refresh()
             try:
+                self.chiller.close()
                 self.chiller.connect()
                 if self._identity and (
                     self.chiller.identity.serial_number != self._identity.serial_number
@@ -77,6 +86,7 @@ class DashboardSession:
                     f"Connection failed: {exc}. Check the device and press Connect to retry."
                 )
                 return None, self.message
+            self.failed = False
             return self.refresh()
 
     def shutdown(self):
@@ -99,76 +109,62 @@ class DashboardSession:
             return None, self.message
 
     def refresh(self, action=None, target_c=None):
-        """Apply one action, read current state, then record it; return (sample, message).
+        """Perform one requested action, read fresh state, then optionally record it.
 
-        Input errors still allow a fresh reading. Device/recording failures lock
-        the session. A successful action must also agree with the final full sample,
-        since the panel could have changed after the method's own readback.
+        Input and readback errors are reported without locking later actions.
+        Commands are never replayed. A broken serial link needs an explicit Connect;
+        a CSV failure stops recording while readings and controls remain available.
         """
         with self._lock:
             self.applied_action = None
-            if self.closed or (self.chiller.identity is None and not self.failed):
+            if self.closed or self.chiller.identity is None:
                 return None, self.message
-            recovering = self.failed
-            if recovering and (not self.chiller.allow_writes or action not in ("stop", "pump-off")):
-                return None, self.message
+            self.failed = False
             expected = None
             rejected = False
-            # First perform the requested action, if any. Never replay a failed action.
             try:
-                if recovering:
-                    # Explicit operator deactivation only: reconnect/reidentify,
-                    # send once, verify. Never replay the failed prior action.
-                    self.chiller.close()
-                    self.chiller.connect()
-                    # A COM port can be reassigned. Recovery must remain on the
-                    # original unit even when no TOML serial binding was supplied.
-                    if self.chiller.identity.serial_number != self._identity.serial_number:
-                        self.chiller.close()
-                        raise ProtocolError("Recovery unit changed; no control command was sent")
                 if action is not None:
                     expected = self._apply_action(action, target_c)
-            except (ValueError, TypeError, PermissionError) as exc:
-                # The rejection is not a sample: query fresh state separately so
-                # invalid input cannot hide a running loop or disable Stop.
+            except (ValueError, TypeError) as exc:
                 self.message = str(exc)
                 rejected = True
             except (OSError, RuntimeError) as exc:
                 return self._fail(exc)
-            # Always read again, even after rejected input, so Stop can remain available.
+
+            sample = None
             try:
+                # Even rejected input gets fresh readings; display is not a device cache.
                 sample = self.chiller.read_sample()
+                self.history.append(sample)
                 if expected:
                     field, value = expected
                     actual = getattr(sample, field)
                     if field == "setpoint_c":
                         matches = abs(actual - value) <= 0.001
+                    elif action == "stop":
+                        matches = actual in ("S", "QUIT")
                     else:
                         matches = actual == value
                     if not matches:
                         raise ProtocolError(
                             f"{action}: verified {value!r}, but latest {field} is {actual!r}; "
-                            "inspect the panel; write was not retried"
+                            "write was not retried"
                         )
                     self.applied_action = action
-                self.history.append(sample)
                 if action is None and not rejected:
                     self.message = f"Updated {sample.timestamp_utc}"
-                elif recovering and not rejected:
-                    self.message = (
-                        f"Operator recovery verified: loop {sample.control_loop}, "
-                        f"pump {sample.pump}. Session remains locked; "
-                        "restart before new control actions."
-                    )
+                if sample.control_loop == "QUIT":
+                    self.message += " Device reports CTL=QUIT; check physical state at the panel."
             except (OSError, RuntimeError) as exc:
-                return self._fail(exc)
-            if self.recorder:
+                return self._fail(exc, sample)
+
+            if self.recorder and not self.recording_error:
                 try:
                     self.recorder.record(sample)
                 except OSError as exc:
-                    # Preserve verified device state while locking the session
-                    # because evidence recording failed. Do not repeat the write.
-                    return self._fail(exc, sample)
+                    self.recording_error = f"CSV recording stopped: {exc}"
+            if self.recording_error:
+                self.message += f" {self.recording_error}"
             return sample, self.message
 
     def _apply_action(self, action, target_c):
@@ -187,7 +183,11 @@ class DashboardSession:
             else:
                 self.chiller.stop()
             expected = "R" if action == "run" else "S"
-            self.message = f"Control loop readback: {expected}"
+            self.message = (
+                "Stop readback accepted (S/QUIT)."
+                if action == "stop"
+                else f"Control loop readback: {expected}"
+            )
             return "control_loop", expected
         if action in ("pump-on", "pump-off"):
             self.chiller.set_pump(action == "pump-on")
@@ -197,50 +197,22 @@ class DashboardSession:
         raise ValueError(f"Unknown dashboard action: {action}")
 
     def _fail(self, exc, sample=None):
-        """Lock the session and return a notice, keeping a valid sample if CSV alone failed."""
+        """Report an error; close an unusable link, but never lock further user actions."""
         self.failed = True
-        recovery = (
-            "Operator Stop loop/Pump off can reconnect for verified deactivation. "
-            if self.chiller.allow_writes
-            else "Use the front panel for physical control. "
-        )
-        self.message = (
-            f"Session stopped: {exc}. New control actions are locked. "
-            f"{recovery}Restart the app before other actions."
-        )
-        if self.recorder:
+        self.message = f"Request failed: {exc}. No command was retried."
+        if isinstance(exc, CommunicationError):
+            self.chiller.close()
+            self.message += " Press Connect to reconnect."
+        else:
+            self.message += " Controls remain available."
+        if self.recorder and not self.recording_error:
             try:
-                self.recorder.record(error=self.message)
+                self.recorder.record(sample, error=self.message)
             except OSError as log_exc:
-                self.message += f" CSV failed: {log_exc}"
+                self.recording_error = f"CSV recording stopped: {log_exc}"
+        if self.recording_error:
+            self.message += f" {self.recording_error}"
         return sample, self.message
-
-
-def disabled_controls(sample, *, writable, failed):
-    """Return {button_id: disabled}; True means the button cannot be clicked.
-
-    Use current device state, not previous clicks. During a failure only Stop and
-    Pump off remain available for explicit recovery, and only if writes are enabled.
-    """
-    disabled = dict.fromkeys(CONTROLS, True)
-    if not writable:
-        return disabled
-    if failed:
-        disabled.update({"stop": False, "pump-off": False})
-        return disabled
-    if sample is not None:
-        stopped = sample.control_loop == "S"
-        level_ok = sample.level == "OK"
-        disabled.update(
-            {
-                "set": False,
-                "run": not stopped or not level_ok,
-                "stop": stopped,
-                "pump-on": not stopped or sample.pump == "ON" or not level_ok,
-                "pump-off": not stopped or sample.pump == "OFF",
-            }
-        )
-    return disabled
 
 
 def history_figure(history):
@@ -295,7 +267,6 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
     # Expose the owned session for embedding/tests. run_dashboard installs shutdown.
     app.nrc_session = session
     app.nrc_shutdown = None
-    writable = chiller.allow_writes
     identity = chiller.identity
 
     def panel(title, caption, *children):
@@ -351,7 +322,7 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
             ),
             panel(
                 "Control",
-                "Writes enabled" if writable else "Read-only session",
+                "Manual control",
                 html.Div(
                     [
                         html.Label("Setpoint / °C", htmlFor="target"),
@@ -360,8 +331,6 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
                             type="number",
                             value=None,
                             step=0.1,
-                            min=chiller.min_c,
-                            max=chiller.max_c,
                             disabled=True,
                         ),
                         *[
@@ -369,7 +338,7 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
                                 label,
                                 id=key,
                                 disabled=True,
-                                **({"className": "primary"} if key == "run" else {}),
+                                **({"className": "primary"} if key == "loop" else {}),
                             )
                             for key, label in CONTROLS.items()
                         ],
@@ -377,8 +346,7 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
                     className="controls",
                 ),
                 html.P(
-                    f"Setpoint window {chiller.min_c:g}–{chiller.max_c:g} °C. "
-                    "Stop the loop before using pump-only controls.",
+                    "Commands are sent on click. The device decides which settings it accepts.",
                     className="muted",
                 ),
                 html.Div(id="notice", role="status"),
@@ -414,6 +382,8 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
         ]
         + [Output(key, "disabled") for key in CONTROLS]
         + [
+            Output("loop", "children"),
+            Output("pump", "children"),
             Output("identity", "children"),
             Output("connect", "disabled"),
             Output("shutdown", "disabled"),
@@ -424,9 +394,25 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
             Input("connect", "n_clicks"),
             Input("shutdown", "n_clicks"),
         ],
-        [State("target", "value"), State("reported-target", "data")],
+        [
+            State("target", "value"),
+            State("reported-target", "data"),
+            State("loop", "children"),
+            State("pump", "children"),
+        ],
     )
-    def update(_tick, _set, _run, _stop, _on, _off, _connect, _shutdown, target, previous_target):
+    def update(
+        _tick,
+        _set,
+        _loop,
+        _pump,
+        _connect,
+        _shutdown,
+        target,
+        previous_target,
+        loop_label,
+        pump_label,
+    ):
         """Choose an action, refresh the session, and return values in Output order.
 
         The click counts only trigger this callback; they are not device state.
@@ -435,7 +421,14 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
         # Dash can batch a timer tick and click into one request. Do not let the
         # first trigger (often poll) swallow the operator's explicit command.
         events = set(ctx.triggered_prop_ids.values())
-        triggered = events.intersection(CONTROLS)
+        # The label is the user's requested command, not an assertion of device state.
+        # Do not invert a fresh read here: it could reverse the action they clicked.
+        requested = {
+            "set": "set",
+            "loop": "stop" if loop_label == "Stop loop" else "run",
+            "pump": "pump-off" if pump_label == "Pump off" else "pump-on",
+        }
+        triggered = {requested[key] for key in events.intersection(CONTROLS)}
         deactivation = None
         if "stop" in triggered:
             deactivation = "stop"
@@ -455,6 +448,22 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
             sample, message = session.connect()
         else:
             sample, message = session.refresh(action, target)
+
+        next_loop_label = loop_label or CONTROLS["loop"]
+        next_pump_label = pump_label or CONTROLS["pump"]
+        if not events.intersection(("connect", "shutdown")):
+            # Offer the opposite request after a click, even if its outcome is
+            # unconfirmed. A known readback below determines the displayed action.
+            if action in ("run", "stop"):
+                next_loop_label = "Stop loop" if action == "run" else "Run loop"
+            elif action in ("pump-on", "pump-off"):
+                next_pump_label = "Pump off" if action == "pump-on" else "Pump on"
+        if sample is not None:
+            if sample.control_loop == "R":
+                next_loop_label = "Stop loop"
+            elif sample.control_loop == "S":
+                next_loop_label = "Run loop"
+            next_pump_label = "Pump off" if sample.pump == "ON" else "Pump on"
         if len(triggered) > 1 and not session.failed and not session.closed:
             if deactivation is not None:
                 message = f"{message} {deactivation} selected from simultaneous controls."
@@ -472,25 +481,24 @@ def create_app(chiller: Chiller, *, recorder=None, csv_path=None, interval_s=1.0
         ]
         synchronize_target = target == previous_target or session.applied_action == "set"
         reported_target = sample.setpoint_c if sample and synchronize_target else no_update
-        blocked = not writable or session.failed or sample is None
-        disabled = disabled_controls(
-            sample, writable=writable and not session.closed, failed=session.failed
-        )
         identity = chiller.identity
+        blocked = session.closed or identity is None
         return (
             metrics,
             history_figure(session.history),
             message,
-            session.failed or session.closed or identity is None,
+            session.closed or identity is None,
             reported_target,
             blocked,
             sample.setpoint_c if sample else no_update,
-            *[disabled[key] for key in CONTROLS],
+            *[blocked for _key in CONTROLS],
+            next_loop_label,
+            next_pump_label,
             f"{identity.model} · {identity.serial_number} · {identity.firmware}"
             f" · {chiller.transport.port}"
             if identity
             else "Disconnected",
-            identity is not None or session.failed or session.closed,
+            (identity is not None and not session.failed) or session.closed,
             session.closed,
         )
 
@@ -531,9 +539,6 @@ def build_parser():
     source = parser.add_mutually_exclusive_group()
     source.add_argument("--simulate", action="store_true", help="Memory-only serial simulator")
     source.add_argument("--port", help="Verified OS serial port, e.g. COM3")
-    parser.add_argument(
-        "--allow-writes", action="store_true", help="Enable explicit control actions"
-    )
     parser.add_argument("--verbose", action="store_true", help="Log serial TX/RX")
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -546,7 +551,7 @@ def build_parser():
     setpoint.add_argument("target_c", type=float)
     commands.add_parser("run", help="Start the control loop")
     commands.add_parser("stop", help="Stop the control loop")
-    pump = commands.add_parser("pump", help="Pump-only control, with the loop stopped")
+    pump = commands.add_parser("pump", help="Set the pump state and verify readback")
     pump.add_argument("state", choices=["on", "off"])
     units = commands.add_parser("units", help="Change the front-panel temperature units")
     units.add_argument("value", choices=["C", "F"])
@@ -638,7 +643,6 @@ def main(argv=None):
             args.config,
             simulate=args.simulate,
             port=args.port,
-            allow_writes=args.allow_writes,
         )
         try:
             if args.command != "gui":

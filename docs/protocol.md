@@ -17,9 +17,9 @@ visual spacing follows the query examples. No address/checksum is documented.
 | VER | Firmware | Raw identity |
 | CST | Supply temperature | Numeric C/F converted to Celsius |
 | TSP | Target | One-decimal numeric write, verify readback |
-| CTL | Control loop | R/S write and readback |
-| PMP | Pump | ON/OFF write and readback, loop stopped |
-| LVL | Level | LOW/OK; LOW blocks Run and Pump on |
+| CTL | Control loop | R/S writes; R/S/QUIT in samples; Stop accepts S/QUIT |
+| PMP | Pump | ON/OFF write and readback; no loop prerequisite |
+| LVL | Level | LOW/OK telemetry; no application control prerequisite |
 | SCF | Display units | C/F write and readback |
 | COL | Coolant percentage | Raw query; configure on panel |
 | DAT | Date | Raw query; configure on panel |
@@ -38,6 +38,17 @@ and date writes are omitted because full encoding/date order is unspecified;
 the low-level transport can frame these writes. Alarm lists/clear, boost, offsets,
 alarm configuration, flow, return temperature and PID settings have no documented
 commands. Use the front panel; LVL does not establish a complete alarm state.
+
+On 2026-10-21 the operator reported the unit already stopped, then supplied a
+Stop failure showing persistent `CTL=QUIT` on firmware 1.0.21. The manual's CTL
+table specifies only R/Run and S/Stop. Based on that observation, Stop now accepts
+S/Stopped or QUIT as terminal replies, while Run still requires R/Running. A
+running Stop transition is polled until S/QUIT or the deadline, without repeating
+the write. Samples retain QUIT verbatim after case normalization; it is not
+globally aliased to S. The dashboard and tutorial apply the same Stop acceptance.
+Other unknown CTL replies still fail validation. This is an operator-reported
+firmware observation with offline regression coverage, not independent physical
+validation of stopping, pump-off or other firmware revisions.
 
 ## Hardware assumptions
 
@@ -61,9 +72,9 @@ or automatic write replay is used. Details and physical limits are in
 [the hardware session](hardware-session-2026-10-14.md).
 The manual also conflicts: page 13 specifies firmware-dependent -5–40/50 °C;
 page 45 lists TSP -10–40. Page 38 lists water 10–50, 10% EG 5–50, 20% EG 0–50,
-30% EG -5–50. Default software limits are 10–40; configured limits must lie within
--5–50 and match actual firmware/coolant. Software cannot verify tank contents;
-manage condensation when cooling below the application's dew point.
+30% EG -5–50. The application imposes no target window; select targets for the
+actual firmware, coolant and experiment. Software cannot verify tank contents.
+These are vendor operating specifications, not application-enforced limits.
 
 ## Transactions and evidence
 
@@ -73,40 +84,35 @@ confirms only that a reply arrived; it is never the setting's success criterion.
 | API method | Write | Required readback / acceptance |
 |---|---|---|
 | `set_setpoint(celsius)` | TSP, rounded to one device decimal | SCF + TSP; same units, transmitted target within 0.001 °C after conversion |
-| `run()` | CTL,R | CTL normalizes to R; LVL=OK checked before writing |
-| `stop()` | CTL,S | CTL normalizes to S; bounded query polling while R, no write replay |
-| `set_pump(on)` | PMP,ON/OFF | PMP equals requested state; CTL=S checked first, LVL=OK before ON |
+| `run()` | CTL,R | CTL normalizes to R; no level prerequisite |
+| `stop()` | CTL,S | CTL is S or QUIT; bounded query polling while R, no write replay |
+| `set_pump(on)` | PMP,ON/OFF | PMP equals requested state; no loop/level prerequisite |
 | `set_units(unit)` | SCF,C/F | SCF equals requested C/F |
 | `set_time(time)` | TIM,HH:MM:SS | Valid clock readback; measured transaction time plus one tick, including midnight |
 
 COL and DAT have no public setters; configure them on the panel. Direct
 `SerialTransport.request(code, data)` is a low-level framing operation: it does
-**not** verify setting readback or apply controller guards. Use the methods above
+**not** verify setting readback. Use the methods above
 for normal operation. Queries require replies, including when write replies are
 configured optional.
 
-A failed/interrupted write or its readback blocks further API writes until explicit
-close/reconnect. Diagnostic queries remain possible if the transport is healthy.
-Inspect the panel first because the uncertain write may have applied. Reconnect
-identifies the unit and resets the write guard; it sends no control command.
+Every connected user can issue control commands. There is no read-only flag,
+software setpoint window, level/loop prerequisite or permanent write-fault latch.
+An error or Ctrl+C may leave a command's outcome uncertain; the error is reported,
+no command is automatically replayed, and the next explicit user action is allowed.
 
 Clear buffered input, send one command, consume one nonempty reply after exact
-echoes. Reply limit: 512 bytes. Timeout, non-ASCII, device error or partial write
-invalidates the session; close/reconnect explicitly. There are no write retries.
-Stop sends CTL,S once and polls readback while R (bare or descriptive), starting
-no extra poll after its deadline; each serial request has its own timeout.
-It never repeats the write. After a dashboard
-fault, operator Stop/Pump off can explicitly reconnect and reidentify the bound
-unit for deactivation; automatic polling and new activation remain locked.
-Recovery also requires the original session serial number when no explicit
-binding is configured. A replacement unit is closed without a control write.
-The GUI reads a complete sample after the method's own readback and checks that
-the affected field still matches. Drift or failure locks the session without replay.
-Rejected input performs no write and still obtains fresh telemetry. CSV failure
-locks recording/control but preserves the successfully queried state on screen.
-Writes have separate readback queries; acceptance is not thermal settling,
-calibration, capacity or circulation proof. Time readback permits measured
-transaction time plus a clock tick, including midnight rollover.
+echoes. Reply limit: 512 bytes. Timeout, non-ASCII or partial/oversized frames make
+the link unusable until close/reconnect. A complete device rejection raises an
+error but leaves the connection usable. The GUI closes a broken link and offers
+Connect again. Reconnection verifies unit identity and sends no control command.
+The GUI reads a complete sample after a setting's own readback and reports drift
+without locking controls. Rejected input still obtains fresh telemetry. CSV errors
+stop recording and retain telemetry while controls remain available. Run/Stop and
+pump readback confirms reported state, not physical flow or thermal performance.
+Stop is sent once; R readback is polled within a bounded deadline until S/QUIT. Each serial
+request has its own timeout. Time readback allows measured elapsed time plus one
+tick, including midnight rollover.
 Observed clock replies leave hours, minutes or seconds unpadded (e.g. `1:7:41`);
 validated readback is normalized to HH:MM:SS. The device date/time was not calibrated.
 

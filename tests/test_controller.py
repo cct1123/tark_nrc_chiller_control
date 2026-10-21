@@ -1,4 +1,4 @@
-"""Offline controller validation, control guards and write/readback checks."""
+"""Offline controller input validation, direct control and write/readback checks."""
 
 import math
 
@@ -9,7 +9,7 @@ from tark_nrc import Chiller, ProtocolError, Simulator
 
 @pytest.fixture
 def chiller():
-    with Chiller(Simulator(), allow_writes=True) as device:
+    with Chiller(Simulator()) as device:
         yield device
 
 
@@ -47,7 +47,7 @@ def test_celsius_api_with_fahrenheit_front_panel(chiller):
     assert chiller.read_sample().device_units == "F"
 
 
-@pytest.mark.parametrize("value", [-5, 0, 9.9, 40.1, 50, math.nan, math.inf, True, None, "", "abc"])
+@pytest.mark.parametrize("value", [math.nan, math.inf, True, None, "", "abc"])
 def test_invalid_target_never_writes(chiller, value):
     peer = chiller.transport._serial
     before = list(peer.commands)
@@ -67,28 +67,28 @@ def test_invalid_target_never_writes(chiller, value):
         lambda c: c.set_time("12:00:00"),
     ],
 )
-def test_read_only_actions_never_send_write(action):
+def test_actions_are_available_without_a_permission_flag(action):
     with Chiller(Simulator()) as device:
-        with pytest.raises(PermissionError):
-            action(device)
-        assert all(b"," not in command for command in device.transport._serial.commands)
+        action(device)
+        assert sum(b"," in command for command in device.transport._serial.commands) == 1
 
 
 @pytest.mark.parametrize("action", [lambda c: c.run(), lambda c: c.set_pump(True)])
-def test_low_level_prevents_start(chiller, action):
+def test_reported_low_level_does_not_block_user_commands(chiller, action):
     peer = chiller.transport._serial
     peer.level = "LOW"
     before = len(peer.commands)
-    with pytest.raises(ValueError, match="LOW"):
-        action(chiller)
-    assert all(b"," not in frame for frame in peer.commands[before:])
+    action(chiller)
+    assert sum(b"," in frame for frame in peer.commands[before:]) == 1
 
 
-def test_pump_control_requires_stopped_loop(chiller):
+def test_pump_request_is_sent_and_device_rejection_does_not_lock_control(chiller):
     chiller.run()
-    with pytest.raises(ValueError, match="Stop the control loop"):
+    with pytest.raises(ProtocolError, match="stop control loop"):
         chiller.set_pump(False)
-    assert chiller.read_sample().control_loop == "R"
+    assert chiller.transport._serial.commands.count(b"$PCPMP,OFF\r\n") == 1
+    chiller.stop()
+    assert chiller.read_sample().control_loop == "S"
 
 
 def test_setpoint_mismatch_does_not_retry(chiller, monkeypatch):
@@ -131,25 +131,38 @@ def test_display_units_changed_during_sample(chiller, monkeypatch):
         chiller.read_sample()
 
 
-def test_explicit_reconnect_resets_uncertain_write_guard(chiller, monkeypatch):
+def test_readback_mismatch_does_not_block_the_next_user_setting(chiller, monkeypatch):
     original = chiller.read_setpoint
     monkeypatch.setattr(chiller, "read_setpoint", lambda: 22)
     with pytest.raises(ProtocolError):
         chiller.set_setpoint(21)
     monkeypatch.setattr(chiller, "read_setpoint", original)
-    chiller.close()
-    chiller.connect()
+    chiller.set_units("C")
     assert chiller.set_setpoint(21) == 21
 
 
-def test_interrupted_readback_also_blocks_future_writes(chiller, monkeypatch):
+def test_interrupted_readback_does_not_lock_future_user_writes(chiller, monkeypatch):
     def interrupt():
         raise KeyboardInterrupt
 
     monkeypatch.setattr(chiller, "read_setpoint", interrupt)
     with pytest.raises(KeyboardInterrupt):
         chiller.set_setpoint(21)
-    before = list(chiller.transport._serial.commands)
-    with pytest.raises(ProtocolError, match="Previous write unverified"):
-        chiller.set_units("F")
-    assert chiller.transport._serial.commands == before
+    chiller.set_units("F")
+    frames = chiller.transport._serial.commands
+    assert frames.count(b"$PCTSP,21.0\r\n") == 1
+    assert frames.count(b"$PCSCF,F\r\n") == 1
+
+
+@pytest.mark.parametrize("target", [-10, 0, 9.9, 40.1, 50])
+def test_finite_targets_are_sent_without_an_application_window(chiller, target):
+    assert chiller.set_setpoint(target) == target
+    assert chiller.transport._serial.commands.count(f"$PCTSP,{target:.1f}\r\n".encode()) == 1
+
+
+def test_unit_conversion_overflow_is_rejected_without_sending_invalid_numeric_text(chiller):
+    chiller.set_units("F")
+    before = len(chiller.transport._serial.commands)
+    with pytest.raises(ValueError, match="finite number"):
+        chiller.set_setpoint(1e308)
+    assert all(b"," not in frame for frame in chiller.transport._serial.commands[before:])

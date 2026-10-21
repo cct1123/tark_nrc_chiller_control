@@ -18,15 +18,6 @@ def test_cli_simulator_read(capsys):
     assert sample["setpoint_c"] == 20
 
 
-def test_cli_requires_backend_and_write_permission(capsys):
-    with pytest.raises(SystemExit) as exc:
-        main(["read"])
-    assert exc.value.code == 2
-    assert main(["--simulate", "set", "22"]) == 1
-    assert "Writes disabled" in capsys.readouterr().out
-    assert main(["--simulate", "--allow-writes", "set", "22"]) == 0
-
-
 @pytest.mark.parametrize(
     "failure,exit_code", [(RuntimeError("Lost link"), 1), (KeyboardInterrupt(), 0)]
 )
@@ -76,11 +67,10 @@ def test_csv_error_row_does_not_repeat_previous_measurement(tmp_path):
 
 def test_config_hardware_does_not_silently_use_simulator(tmp_path):
     path = tmp_path / "lab.toml"
-    path.write_text('[serial]\nport="COM9999"\n[control]\nallow_writes=false\n')
+    path.write_text('[serial]\nport="COM9999"\n')
     device = create_chiller(path)
     assert device.transport.backend == "hardware"
     assert device.transport.settings.port == "COM9999"
-    assert not device.allow_writes
     assert device.transport._serial is None
 
 
@@ -95,43 +85,6 @@ def test_config_loads_usb_binding_and_explicit_port_overrides_it(tmp_path):
     assert override.transport.settings.usb_serial_number is None
 
 
-def test_dashboard_actions_invalid_input_and_failure(tmp_path, monkeypatch):
-    with Chiller(Simulator(), allow_writes=True) as device:
-        with CsvRecorder(tmp_path / "gui.csv", device.identity, "simulator") as recorder:
-            session = DashboardSession(device, recorder)
-            assert session.refresh()[0] is not None
-            assert session.refresh("set", 22)[0].setpoint_c == 22
-            assert session.refresh("run")[0].control_loop == "R"
-            assert session.refresh("pump-off")[0].control_loop == "R"
-            assert not session.failed
-            assert session.refresh("stop")[0].control_loop == "S"
-            assert session.refresh("pump-off")[0].pump == "OFF"
-            assert session.refresh("set", 100)[0].setpoint_c == 22
-            assert not session.failed
-
-            def fail():
-                raise CommunicationError("Lost serial link")
-
-            monkeypatch.setattr(device, "read_sample", fail)
-            assert session.refresh()[0] is None
-            assert session.failed
-            count = recorder.rows
-            assert session.refresh("run")[0] is None
-            assert recorder.rows == count
-
-
-def test_dashboard_csv_failure_stops_session(monkeypatch):
-    with Chiller(Simulator()) as device:
-
-        class BrokenRecorder:
-            def record(self, *args, **kwargs):
-                raise PermissionError("Disk not writable")
-
-        session = DashboardSession(device, BrokenRecorder())
-        assert session.refresh()[0].control_loop == "S"
-        assert session.failed and len(session.history) == 1
-
-
 def test_dash_routes_layout_and_packaged_style():
     with Chiller(Simulator()) as device:
         app = create_app(device)
@@ -139,7 +92,7 @@ def test_dash_routes_layout_and_packaged_style():
         for route in ["/", "/_dash-layout", "/_dash-dependencies", "/assets/instrument.css"]:
             assert client.get(route).status_code == 200
         layout = client.get("/_dash-layout").get_json()
-        assert "Read-only session" in json.dumps(layout)
+        assert "Manual control" in json.dumps(layout)
         assert "SIMULATOR" in json.dumps(layout)
 
 
@@ -148,11 +101,18 @@ def refresh_dashboard(app, target=None, previous_target=None, action="poll", cha
     payload = dashboard_payload(app, target, previous_target, action, changed)
     response = app.server.test_client().post("/_dash-update-component", json=payload)
     assert response.status_code == 200
-    return response.get_json()["response"]
+    result = response.get_json()["response"]
+    # Model the browser applying returned labels before the next click.
+    app._browser_button_labels = {
+        "loop": result["loop"]["children"],
+        "pump": result["pump"]["children"],
+    }
+    return result
 
 
 def dashboard_payload(app, target=None, previous_target=None, action="poll", changed=None):
     """Construct a callback request for either the test client or a live local server."""
+    labels = getattr(app, "_browser_button_labels", {"loop": "Run loop", "pump": "Pump on"})
     key, callback = next(iter(app.callback_map.items()))
     outputs = [
         {"id": output.component_id, "property": output.component_property}
@@ -173,6 +133,8 @@ def dashboard_payload(app, target=None, previous_target=None, action="poll", cha
         "state": [
             {"id": "target", "property": "value", "value": target},
             {"id": "reported-target", "property": "data", "value": previous_target},
+            {"id": "loop", "property": "children", "value": labels["loop"]},
+            {"id": "pump", "property": "children", "value": labels["pump"]},
         ],
         "changedPropIds": changed
         or [f"{action}.{'n_intervals' if action == 'poll' else 'n_clicks'}"],
@@ -180,70 +142,20 @@ def dashboard_payload(app, target=None, previous_target=None, action="poll", cha
 
 
 def test_dashboard_initializes_live_target_and_preserves_operator_edit():
-    with Chiller(Simulator(), allow_writes=True, min_c=12, max_c=20) as device:
+    with Chiller(Simulator()) as device:
         device.set_setpoint(12)
         app = create_app(device)
         first = refresh_dashboard(app)
         assert first["target"]["value"] == 12
         assert not first["target"]["disabled"]
-        assert not first["run"]["disabled"]
+        assert not first["loop"]["disabled"]
         later = refresh_dashboard(app, target=13, previous_target=12)
         assert "value" not in later["target"]  # Polling must not overwrite an edit.
         assert len(app.nrc_session.history) == 2
 
 
-def test_dashboard_failure_locks_new_actions_but_keeps_operator_deactivation(monkeypatch):
-    with Chiller(Simulator(), allow_writes=True) as device:
-        app = create_app(device)
-        refresh_dashboard(app)
-
-        def fail():
-            raise CommunicationError("Lost actual serial link (software test)")
-
-        monkeypatch.setattr(device, "read_sample", fail)
-        failed = refresh_dashboard(app, target=20)
-        assert failed["poll"]["disabled"]
-        assert all(failed[key]["disabled"] for key in ("target", "set", "run", "pump-on"))
-        assert not failed["stop"]["disabled"] and not failed["pump-off"]["disabled"]
-        assert "Session stopped" in failed["notice"]["children"]
-        assert len(app.nrc_session.history) == 1
-
-
-def test_operator_stop_recovery_reidentifies_and_never_replays_run(monkeypatch):
-    with Chiller(Simulator(), allow_writes=True) as device:
-        session = DashboardSession(device)
-        original_read = device.read_sample
-
-        def fail():
-            raise CommunicationError("Link failed")
-
-        monkeypatch.setattr(device, "read_sample", fail)
-        assert session.refresh()[0] is None and session.failed
-        monkeypatch.setattr(device, "read_sample", original_read)
-        sample, message = session.refresh("stop")
-        assert sample.control_loop == "S"
-        assert "recovery verified" in message and session.failed
-        frames = device.transport._serial.commands
-        assert frames[:3] == [b"$PCMOD\r\n", b"$PCSSN\r\n", b"$PCVER\r\n"]
-        assert frames.count(b"$PCCTL,S\r\n") == 1
-        assert b"$PCCTL,R\r\n" not in frames
-        before = len(frames)
-        assert session.refresh("run")[0] is None
-        assert len(frames) == before
-
-
-def test_dashboard_disables_pump_only_controls_while_loop_runs():
-    with Chiller(Simulator(), allow_writes=True) as device:
-        device.run()
-        app = create_app(device)
-        state = refresh_dashboard(app)
-        assert state["run"]["disabled"]
-        assert state["pump-on"]["disabled"] and state["pump-off"]["disabled"]
-        assert not state["stop"]["disabled"]
-
-
 def test_dashboard_follows_external_target_changes_but_preserves_drafts():
-    with Chiller(Simulator(), allow_writes=True) as device:
+    with Chiller(Simulator()) as device:
         app = create_app(device)
         first = refresh_dashboard(app)
         assert first["reported-target"]["data"] == 20
@@ -259,144 +171,82 @@ def test_dashboard_follows_external_target_changes_but_preserves_drafts():
 
 
 def test_invalid_gui_target_keeps_live_state_and_stop_available():
-    with Chiller(Simulator(), allow_writes=True) as device:
+    with Chiller(Simulator()) as device:
         device.run()
         app = create_app(device)
         refresh_dashboard(app)
         before = list(device.transport._serial.commands)
-        rejected = refresh_dashboard(app, target=100, previous_target=20, action="set")
-        assert not rejected["stop"]["disabled"]
+        rejected = refresh_dashboard(app, target=None, previous_target=20, action="set")
+        assert not rejected["loop"]["disabled"]
         assert not rejected["poll"]["disabled"]
         assert "R / ON" in json.dumps(rejected["telemetry"])
-        assert "Setpoint must be" in rejected["notice"]["children"]
+        assert "finite number" in rejected["notice"]["children"]
         assert all(b"," not in frame for frame in device.transport._serial.commands[len(before) :])
         assert "value" not in rejected["target"]
 
 
-def test_action_readback_drift_locks_gui_without_replaying_write(monkeypatch):
-    with Chiller(Simulator(), allow_writes=True) as device:
-        app = create_app(device)
-        refresh_dashboard(app)
-        original = device.read_sample
-        monkeypatch.setattr(device, "read_sample", lambda: replace(original(), control_loop="S"))
-        failed = refresh_dashboard(app, target=20, previous_target=20, action="run")
-        assert failed["poll"]["disabled"] and failed["run"]["disabled"]
-        assert not failed["stop"]["disabled"]
-        assert "latest control_loop" in failed["notice"]["children"]
-        assert device.transport._serial.commands.count(b"$PCCTL,R\r\n") == 1
-
-
-def test_csv_failure_preserves_verified_stop_readback():
-    class BrokenRecorder:
-        def record(self, *args, **kwargs):
-            raise OSError("Disk full")
-
-    with Chiller(Simulator(), allow_writes=True) as device:
-        device.run()
-        session = DashboardSession(device, BrokenRecorder())
-        sample, message = session.refresh("stop")
-        assert sample.control_loop == "S"
-        assert session.failed and "Disk full" in message
-        assert device.transport._serial.commands.count(b"$PCCTL,S\r\n") == 1
-
-
 @pytest.mark.parametrize(
-    "action,field,expected",
+    "button,initial,field,expected",
     [
-        ("set", "setpoint_c", 22),
-        ("run", "control_loop", "R"),
-        ("stop", "control_loop", "S"),
-        ("pump-on", "pump", "ON"),
-        ("pump-off", "pump", "OFF"),
+        ("set", None, "setpoint_c", 22),
+        ("loop", "S", "control_loop", "R"),
+        ("loop", "R", "control_loop", "S"),
+        ("pump", "OFF", "pump", "ON"),
+        ("pump", "ON", "pump", "OFF"),
     ],
 )
-def test_poll_and_button_same_request_performs_button_once(action, field, expected):
-    with Chiller(Simulator(), allow_writes=True) as device:
-        if action == "stop":
+def test_poll_and_toggle_same_request_sends_the_displayed_command_once(
+    button, initial, field, expected
+):
+    with Chiller(Simulator()) as device:
+        if button == "loop" and initial == "R":
             device.run()
-        elif action == "pump-off":
+        elif button == "pump" and initial == "ON":
             device.set_pump(True)
         app = create_app(device)
         refresh_dashboard(app)
         before = len(device.transport._serial.commands)
         refresh_dashboard(
-            app, target=22, previous_target=20, changed=["poll.n_intervals", f"{action}.n_clicks"]
+            app, target=22, previous_target=20, changed=["poll.n_intervals", f"{button}.n_clicks"]
         )
         assert getattr(app.nrc_session.history[-1], field) == expected
-        writes = [frame for frame in device.transport._serial.commands[before:] if b"," in frame]
-        assert len(writes) == 1
+        assert sum(b"," in frame for frame in device.transport._serial.commands[before:]) == 1
 
 
 def test_simultaneous_activation_controls_are_rejected_without_writes():
-    with Chiller(Simulator(), allow_writes=True) as device:
+    with Chiller(Simulator()) as device:
         app = create_app(device)
         before = len(device.transport._serial.commands)
-        result = refresh_dashboard(app, target=22, changed=["set.n_clicks", "run.n_clicks"])
+        result = refresh_dashboard(app, target=22, changed=["set.n_clicks", "loop.n_clicks"])
         assert "choose one action" in result["notice"]["children"]
         assert all(b"," not in frame for frame in device.transport._serial.commands[before:])
 
 
-def test_simultaneous_controls_prioritize_stop_without_implicit_pump_off():
-    with Chiller(Simulator(), allow_writes=True) as device:
+def test_simultaneous_stop_and_pump_off_prioritize_stop_without_implicit_pump_write():
+    with Chiller(Simulator()) as device:
         device.run()
         app = create_app(device)
+        initial = refresh_dashboard(app)
+        assert initial["loop"]["children"] == "Stop loop"
+        assert initial["pump"]["children"] == "Pump off"
         before = len(device.transport._serial.commands)
-        refresh_dashboard(app, changed=["run.n_clicks", "pump-off.n_clicks", "stop.n_clicks"])
+        refresh_dashboard(app, changed=["loop.n_clicks", "pump.n_clicks"])
         writes = [frame for frame in device.transport._serial.commands[before:] if b"," in frame]
         assert writes == [b"$PCCTL,S\r\n"]
-        assert app.nrc_session.history[-1].control_loop == "S"
         assert app.nrc_session.history[-1].pump == "ON"
 
 
-def test_simultaneous_controls_preserve_rejected_deactivation_reason():
-    with Chiller(Simulator(), allow_writes=True) as device:
-        device.run()
-        app = create_app(device)
-        before = len(device.transport._serial.commands)
-        result = refresh_dashboard(app, changed=["set.n_clicks", "pump-off.n_clicks"])
-        assert "Stop the control loop" in result["notice"]["children"]
-        assert all(b"," not in frame for frame in device.transport._serial.commands[before:])
-        assert not result["stop"]["disabled"]
-
-
-def test_recovery_rejects_replaced_unit_even_without_configured_serial_binding(monkeypatch):
-    with Chiller(Simulator(), allow_writes=True) as device:
-        session = DashboardSession(device)
-        session.failed = True
-        original_connect = device.connect
-
-        def connect_replacement():
-            original_connect()
-            device.identity = replace(device.identity, serial_number="OTHER-UNIT")
-
-        sent = []
-        original_close = device.close
-
-        def capture_close():
-            if device.transport._serial:
-                sent.extend(device.transport._serial.commands)
-            original_close()
-
-        monkeypatch.setattr(device, "connect", connect_replacement)
-        monkeypatch.setattr(device, "close", capture_close)
-        sample, message = session.refresh("stop")
-        assert sample is None and session.failed
-        assert "Recovery unit changed" in message
-        assert device.identity is None
-        assert not any(b"," in frame for frame in sent)
-
-
 def test_dashboard_waits_for_connect_and_opens_csv_after_identification(tmp_path):
-    device = Chiller(Simulator(), allow_writes=True)
+    device = Chiller(Simulator())
     path = tmp_path / "connected.csv"
     app = create_app(device, csv_path=path)
     try:
-        initial = refresh_dashboard(app, action="run")
+        initial = refresh_dashboard(app, action="loop")
         assert device.identity is None and device.transport._serial is None
         assert initial["poll"]["disabled"] and not initial["connect"]["disabled"]
-        assert all(initial[key]["disabled"] for key in ("set", "run", "stop", "pump-off"))
+        assert all(initial[key]["disabled"] for key in ("set", "loop", "pump"))
         assert not path.exists()
-        connected = refresh_dashboard(app, changed=["connect.n_clicks", "run.n_clicks"])
+        connected = refresh_dashboard(app, changed=["connect.n_clicks", "loop.n_clicks"])
         assert not connected["poll"]["disabled"] and connected["connect"]["disabled"]
         assert "SIMULATOR-0001" in connected["identity"]["children"]
         assert connected["target"]["value"] == 20
@@ -408,50 +258,24 @@ def test_dashboard_waits_for_connect_and_opens_csv_after_identification(tmp_path
         assert next(csv.DictReader(stream))["serial_number"] == "SIMULATOR-0001"
 
 
-def test_connect_failure_can_retry_but_does_not_clear_runtime_fault(monkeypatch):
-    device = Chiller(Simulator(), allow_writes=True)
-    app = create_app(device)
-    connect = device.connect
-
-    def fail():
-        raise CommunicationError("Port unavailable")
-
-    monkeypatch.setattr(device, "connect", fail)
-    rejected = refresh_dashboard(app, action="connect")
-    assert "Connection failed" in rejected["notice"]["children"]
-    assert not rejected["connect"]["disabled"] and rejected["poll"]["disabled"]
-    monkeypatch.setattr(device, "connect", connect)
-    try:
-        refresh_dashboard(app, action="connect")
-        monkeypatch.setattr(device, "read_sample", fail)
-        refresh_dashboard(app)
-        serial = device.transport._serial
-        before = list(serial.commands)
-        locked = refresh_dashboard(app, action="connect")
-        assert app.nrc_session.failed and locked["connect"]["disabled"]
-        assert serial.commands == before
-    finally:
-        app.nrc_session.shutdown()
-
-
 def test_shutdown_closes_csv_and_port_without_control_writes(tmp_path):
-    device = Chiller(Simulator(), allow_writes=True)
+    device = Chiller(Simulator())
     app = create_app(device, csv_path=tmp_path / "shutdown.csv")
     refresh_dashboard(app, action="connect")
-    refresh_dashboard(app, action="run")
+    refresh_dashboard(app, action="loop")
     serial = device.transport._serial
     before = list(serial.commands)
     stopped = refresh_dashboard(
-        app, changed=["poll.n_intervals", "shutdown.n_clicks", "stop.n_clicks"]
+        app, changed=["poll.n_intervals", "shutdown.n_clicks", "loop.n_clicks"]
     )
     assert app.nrc_session.closed and device.identity is None
     assert device.transport._serial is None and serial.commands == before
     assert app.nrc_session.recorder._file.closed
     assert stopped["poll"]["disabled"] and stopped["connect"]["disabled"]
     assert stopped["shutdown"]["disabled"]
-    assert all(stopped[key]["disabled"] for key in ("target", "run", "stop", "pump-off"))
+    assert all(stopped[key]["disabled"] for key in ("target", "loop", "pump"))
     refresh_dashboard(app, action="connect")
-    refresh_dashboard(app, action="stop")
+    refresh_dashboard(app, action="loop")
     assert device.identity is None and serial.commands == before
 
 
@@ -483,7 +307,7 @@ def test_cli_gui_loads_local_config_without_opening_port(tmp_path, monkeypatch, 
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / filename).write_text(
-        '[serial]\nport="COM9999"\n[control]\nallow_writes=false\nmin_c=12\nmax_c=20\n'
+        '[serial]\nport="COM9999"\n[control]\nexpected_serial_number="TEST-SERIAL"\n'
     )
     seen = []
 
@@ -491,8 +315,6 @@ def test_cli_gui_loads_local_config_without_opening_port(tmp_path, monkeypatch, 
         seen.append(device)
         assert device.transport.backend == "hardware"
         assert device.transport.settings.port == "COM9999"
-        assert not device.allow_writes
-        assert (device.min_c, device.max_c) == (12, 20)
         assert device.identity is None and device.transport._serial is None
 
     monkeypatch.setattr(gui, "run_dashboard", serve)
@@ -568,3 +390,228 @@ def test_gui_shutdown_returns_http_response_and_stops_real_server(monkeypatch):
         if thread.is_alive() and "server" in captured:
             Thread(target=captured["server"].shutdown, daemon=True).start()
             thread.join(5)
+
+
+def test_cli_controls_work_without_permission_flags(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["read"])
+    assert exc.value.code == 2
+    assert main(["--simulate", "set", "45"]) == 0
+    assert "45.00 C" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "button,field,expected",
+    [("set", "setpoint_c", 45), ("loop", "control_loop", "R"), ("pump", "pump", "ON")],
+)
+def test_each_combined_control_works_from_quit(button, field, expected):
+    with Chiller(Simulator()) as device:
+        peer = device.transport._serial
+        peer.loop = "QUIT"
+        app = create_app(device)
+        initial = refresh_dashboard(app)
+        assert initial["loop"]["children"] == "Run loop"
+        assert initial["pump"]["children"] == "Pump on"
+        assert all(not initial[key]["disabled"] for key in ("target", "set", "loop", "pump"))
+        before = len(peer.commands)
+        result = refresh_dashboard(app, target=45, action=button)
+        assert getattr(app.nrc_session.history[-1], field) == expected
+        assert sum(b"," in frame for frame in peer.commands[before:]) == 1
+        assert not app.nrc_session.failed and not result["poll"]["disabled"]
+        if button in ("loop", "pump"):
+            before = len(peer.commands)
+            result = refresh_dashboard(app, action=button)
+            assert getattr(app.nrc_session.history[-1], field) == (
+                "S" if button == "loop" else "OFF"
+            )
+            assert sum(b"," in frame for frame in peer.commands[before:]) == 1
+
+
+@pytest.mark.parametrize("latest_loop", ["QUIT", "R"])
+def test_stop_accepts_persistent_quit_but_rejects_running_sample(monkeypatch, latest_loop):
+    with Chiller(Simulator()) as device:
+        peer = device.transport._serial
+        peer.loop = "QUIT"
+        write = peer.write
+
+        def reply_with_quit(frame):
+            count = write(frame)
+            if frame == b"$PCCTL,S\r\n":
+                peer.loop = "QUIT"  # Operator-observed terminal reply on firmware 1.0.21.
+            return count
+
+        monkeypatch.setattr(peer, "write", reply_with_quit)
+        read_sample = device.read_sample
+        monkeypatch.setattr(
+            device, "read_sample", lambda: replace(read_sample(), control_loop=latest_loop)
+        )
+        app = create_app(device)
+        app._browser_button_labels = {"loop": "Stop loop", "pump": "Pump on"}
+        result = refresh_dashboard(app, action="loop")
+        assert peer.commands.count(b"$PCCTL,S\r\n") == 1
+        assert app.nrc_session.failed == (latest_loop == "R")
+        if latest_loop == "QUIT":
+            assert "QUIT / OFF" in json.dumps(result["telemetry"])
+            assert "Stop readback accepted" in result["notice"]["children"]
+        else:
+            assert "latest control_loop" in result["notice"]["children"]
+
+
+def test_all_controls_remain_available_while_running_and_after_device_rejection():
+    with Chiller(Simulator()) as device:
+        device.run()
+        app = create_app(device)
+        state = refresh_dashboard(app)
+        assert all(not state[key]["disabled"] for key in ("target", "set", "loop", "pump"))
+        rejected = refresh_dashboard(app, action="pump")
+        assert "device rejected" in rejected["notice"]["children"]
+        assert not rejected["loop"]["disabled"] and not rejected["poll"]["disabled"]
+        assert device.transport._serial.commands.count(b"$PCPMP,OFF\r\n") == 1
+        stopped = refresh_dashboard(app, action="loop")
+        assert not app.nrc_session.failed
+        assert "S / ON" in json.dumps(stopped["telemetry"])
+
+
+def test_readback_drift_reports_actual_sample_without_locking_next_action(monkeypatch):
+    with Chiller(Simulator()) as device:
+        app = create_app(device)
+        original = device.read_sample
+        monkeypatch.setattr(device, "read_sample", lambda: replace(original(), control_loop="S"))
+        failed = refresh_dashboard(app, action="loop")
+        assert "latest control_loop" in failed["notice"]["children"]
+        assert "S / ON" in json.dumps(failed["telemetry"])
+        assert not failed["loop"]["disabled"] and not failed["poll"]["disabled"]
+        assert device.transport._serial.commands.count(b"$PCCTL,R\r\n") == 1
+        monkeypatch.setattr(device, "read_sample", original)
+        refresh_dashboard(app, target=21, action="set")
+        assert not app.nrc_session.failed
+
+
+def test_csv_error_preserves_readings_and_does_not_block_later_control():
+    class BrokenRecorder:
+        path = "broken.csv"
+
+        def record(self, *args, **kwargs):
+            raise PermissionError("Disk full")
+
+    with Chiller(Simulator()) as device:
+        app = create_app(device, recorder=BrokenRecorder())
+        reading = refresh_dashboard(app)
+        assert "Disk full" in reading["notice"]["children"]
+        assert "24.00" in json.dumps(reading["telemetry"])
+        assert not app.nrc_session.failed and not reading["loop"]["disabled"]
+        running = refresh_dashboard(app, action="loop")
+        assert "R / ON" in json.dumps(running["telemetry"])
+        assert "CSV recording stopped" in running["notice"]["children"]
+        assert not running["poll"]["disabled"]
+
+
+def test_link_failure_offers_explicit_reconnect_without_restart_or_replay(monkeypatch):
+    device = Chiller(Simulator())
+    app = create_app(device)
+    connect = device.connect
+    read = device.read_sample
+
+    def fail():
+        raise CommunicationError("Link failed")
+
+    monkeypatch.setattr(device, "connect", fail)
+    rejected = refresh_dashboard(app, action="connect")
+    assert not rejected["connect"]["disabled"] and rejected["poll"]["disabled"]
+    monkeypatch.setattr(device, "connect", connect)
+    try:
+        refresh_dashboard(app, action="connect")
+        peer = device.transport._serial
+        monkeypatch.setattr(device, "read_sample", fail)
+        failed = refresh_dashboard(app)
+        assert device.identity is None and not peer.is_open
+        assert not failed["connect"]["disabled"] and failed["poll"]["disabled"]
+        monkeypatch.setattr(device, "read_sample", read)
+        reconnected = refresh_dashboard(app, action="connect")
+        assert not app.nrc_session.failed and not reconnected["loop"]["disabled"]
+        assert not any(b"," in frame for frame in device.transport._serial.commands)
+        refresh_dashboard(app, action="loop")
+        assert device.transport._serial.commands.count(b"$PCCTL,R\r\n") == 1
+    finally:
+        app.nrc_session.shutdown()
+
+
+def test_explicit_reconnect_still_verifies_original_device_identity(monkeypatch):
+    with Chiller(Simulator()) as device:
+        session = DashboardSession(device)
+        session.failed = True
+        original = device.connect
+
+        def replacement():
+            original()
+            device.identity = replace(device.identity, serial_number="OTHER-UNIT")
+
+        monkeypatch.setattr(device, "connect", replacement)
+        sample, message = session.connect()
+        assert sample is None and "Connection unit changed" in message
+        assert device.identity is None
+
+
+def test_polling_follows_panel_state_without_sending_commands():
+    with Chiller(Simulator()) as device:
+        app = create_app(device)
+        peer = device.transport._serial
+        first = refresh_dashboard(app)
+        assert first["loop"]["children"] == "Run loop"
+        assert first["pump"]["children"] == "Pump on"
+        peer.loop, peer.pump = "R", "ON"
+        running = refresh_dashboard(app)
+        assert running["loop"]["children"] == "Stop loop"
+        assert running["pump"]["children"] == "Pump off"
+        peer.loop, peer.pump = "S", "OFF"
+        stopped = refresh_dashboard(app)
+        assert stopped["loop"]["children"] == "Run loop"
+        assert stopped["pump"]["children"] == "Pump on"
+        assert not any(b"," in frame for frame in peer.commands)
+
+
+@pytest.mark.parametrize("button", ["loop", "pump"])
+def test_panel_change_before_click_does_not_reverse_the_displayed_request(button):
+    with Chiller(Simulator()) as device:
+        peer = device.transport._serial
+        if button == "loop":
+            device.run()
+        else:
+            device.set_pump(True)
+        app = create_app(device)
+        displayed = refresh_dashboard(app)
+        assert displayed[button]["children"] == ("Stop loop" if button == "loop" else "Pump off")
+        # Panel changes after the browser rendered its button, before the click arrives.
+        peer.loop, peer.pump = "S", "OFF"
+        before = len(peer.commands)
+        result = refresh_dashboard(app, action=button)
+        writes = [frame for frame in peer.commands[before:] if b"," in frame]
+        assert writes == [b"$PCCTL,S\r\n" if button == "loop" else b"$PCPMP,OFF\r\n"]
+        assert result[button]["children"] == ("Run loop" if button == "loop" else "Pump on")
+
+
+def test_unconfirmed_run_still_offers_explicit_stop_without_claiming_running(monkeypatch):
+    with Chiller(Simulator()) as device:
+        peer = device.transport._serial
+        peer.loop = "QUIT"
+        request = device.transport.request
+
+        def unconfirmed(command, data=None):
+            result = request(command, data)
+            if command == "CTL" and data == "R":
+                peer.loop = "QUIT"
+            return result
+
+        monkeypatch.setattr(device.transport, "request", unconfirmed)
+        app = create_app(device)
+        refresh_dashboard(app)
+        failed = refresh_dashboard(app, action="loop")
+        assert "QUIT" in failed["notice"]["children"]
+        assert failed["loop"]["children"] == "Stop loop"
+        polled = refresh_dashboard(app)
+        assert "QUIT / ON" in json.dumps(polled["telemetry"])
+        assert polled["loop"]["children"] == "Stop loop"
+        stopped = refresh_dashboard(app, action="loop")
+        assert stopped["loop"]["children"] == "Run loop"
+        assert peer.commands.count(b"$PCCTL,R\r\n") == 1
+        assert peer.commands.count(b"$PCCTL,S\r\n") == 1

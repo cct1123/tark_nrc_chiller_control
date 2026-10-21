@@ -12,7 +12,6 @@ import math
 import re
 import time
 import tomllib
-from contextlib import contextmanager
 from dataclasses import asdict, dataclass, fields
 from datetime import datetime, timezone
 from pathlib import Path
@@ -98,7 +97,8 @@ class SerialTransport:
     Construction opens nothing; call open() and close() explicitly. serial_factory
     normally defaults to serial.Serial. The simulator and tests supply a fake
     serial object with the same read/write methods, keeping this code shared.
-    A failed exchange blocks further requests until close/open; nothing is retried.
+    A framing/I/O failure needs close/open; a complete device rejection leaves the
+    link usable. Nothing is retried automatically.
     """
 
     backend = "hardware"
@@ -195,10 +195,13 @@ class SerialTransport:
                     return reply
                 line.extend(byte)
                 if len(line) > 512:
-                    raise ProtocolError("Serial response exceeded 512 bytes")
+                    raise CommunicationError("Serial response exceeded 512 bytes")
             if optional_reply and not line:
                 return ""
             raise CommunicationError(f"{command}: no complete CR/LF-terminated reply")
+        except ProtocolError:
+            # A complete device rejection is a usable reply, not a broken link.
+            raise
         except (OSError, UnicodeError, RuntimeError) as exc:
             self._faulted = True
             suffix = "; write may have applied; it was not retried" if data is not None else ""
@@ -218,7 +221,9 @@ class Identity:
 class Sample:
     """One round of device readings, timestamped after the final query.
 
-    control_loop is R (running) or S (stopped); pump is ON/OFF; level is OK/LOW.
+    control_loop is R (running), S (stopped), or the preserved firmware status QUIT.
+    Stop accepts S/QUIT; neither establishes physical pump-off. Pump is ON/OFF;
+    level is OK/LOW.
     device_units records the panel's C/F setting, while temperatures here are
     always Celsius. coolant is the device's raw code, not verified tank contents.
     """
@@ -254,8 +259,8 @@ def finite_number(value, label: str) -> float:
 class Chiller:
     """User API for one connected chiller; setting methods send once, then read back.
 
-    A failed write/readback blocks subsequent writes until explicit reconnect.
-    Reads remain available if the transport still works. Closing the connection
+    Commands are available whenever connected. Device rejections and mismatched
+    readbacks raise errors without locking later user actions. Closing the port
     leaves the equipment running in its current state.
 
     Typical use: with create_chiller(simulate=True) as chiller: ...
@@ -266,32 +271,21 @@ class Chiller:
         self,
         transport: SerialTransport,
         *,
-        allow_writes=False,
-        min_c=10.0,
-        max_c=40.0,
         expected_serial_number: str | None = None,
     ):
         self.transport = transport
-        self.allow_writes = allow_writes
-        self.min_c = finite_number(min_c, "Minimum")
-        self.max_c = finite_number(max_c, "Maximum")
-        if not -5 <= self.min_c < self.max_c <= 50:
-            raise ValueError("Setpoint limits must be ordered within -5 to 50 Celsius")
-        if type(allow_writes) is not bool:
-            raise ValueError("allow_writes must be a boolean")
         if expected_serial_number is not None and (
             not isinstance(expected_serial_number, str) or not expected_serial_number.strip()
         ):
             raise ValueError("expected_serial_number must be a nonempty string or None")
         self.expected_serial_number = expected_serial_number
         self.identity: Identity | None = None
-        self._write_uncertain = False
         # Public operations call other public operations (read_sample -> query).
         # RLock lets the same thread acquire this lock again without deadlocking.
         self._lock = RLock()
 
     def connect(self):
-        """Open and identify the unit using queries only; reset the write fault on success."""
+        """Open and identify the unit using queries only; send no control commands."""
         with self._lock:
             if self.identity is not None:
                 raise RuntimeError("Already connected")
@@ -310,7 +304,6 @@ class Chiller:
                         f"device reported {serial_number!r}"
                     )
                 self.identity = Identity(model, serial_number, self.transport.request("VER"))
-                self._write_uncertain = False
             except BaseException:
                 self.transport.close()
                 raise
@@ -391,7 +384,9 @@ class Chiller:
             units = self._read_choice("SCF", ("C", "F"))
             temperature_c = self._read_temperature_c("CST", units)
             setpoint_c = self._read_temperature_c("TSP", units)
-            control_loop = self._read_choice("CTL", ("R", "S"))
+            # Preserve QUIT as reported; firmware 1.0.21 returned it after Stop
+            # while the operator observed the unit already stopped.
+            control_loop = self._read_choice("CTL", ("R", "S", "QUIT"))
             pump = self._read_choice("PMP", ("ON", "OFF"))
             level = self._read_choice("LVL", ("OK", "LOW"))
             coolant = self.query("COL")
@@ -409,103 +404,79 @@ class Chiller:
                 coolant=coolant,
             )
 
-    @contextmanager
-    def _verified_write(self, command, value):
-        """Guard one setting operation, including the caller's readback checks.
+    def _write_and_check_choice(self, command, value, choices, error):
+        """Write a status setting and verify its accepted readback.
 
-        Code before yield sends the command. The caller's with block then reads
-        and checks the device state. If either part fails, including Ctrl+C, mark
-        the outcome uncertain and block later writes until reconnect. A reply
-        alone is insufficient: the caller must verify inside the with block.
+        Stop accepts S or the observed terminal QUIT reply. While still running,
+        query until stopped or the deadline; never resend the command.
         """
-        if not self.allow_writes:
-            raise PermissionError("Writes disabled; enable allow_writes explicitly")
         if self.identity is None:
             raise RuntimeError("Connect first")
-        if self._write_uncertain:
-            raise ProtocolError("Previous write unverified; inspect the panel and close/reconnect")
-        try:
-            self.transport.request(command, value)
-            yield
-        except BaseException:
-            # Catch Ctrl+C too: the device may have acted before Python was interrupted.
-            self._write_uncertain = True
-            raise
-
-    def _write_and_check_choice(self, command, value, choices, error):
-        """Write a status setting and require its readback to equal the requested value.
-
-        Stop may still report running briefly. In that case, query until the
-        deadline, sending the Stop command only once. Other mismatches fail at once.
-        """
-        with self._verified_write(command, value):
-            deadline = time.monotonic() + self.transport.settings.timeout_s
-            while True:
-                reported = self._read_choice(command, choices)
-                if reported == value:
-                    return
-                # A running readback can precede Stop taking effect. Poll queries
-                # only; never resend the write, even when the deadline expires.
-                stopping = command == "CTL" and value == "S" and reported == "R"
-                remaining = deadline - time.monotonic()
-                if stopping and remaining > 0:
-                    time.sleep(min(0.1, remaining))
-                    if time.monotonic() < deadline:
-                        continue
-                raise ProtocolError(error)
+        self.transport.request(command, value)
+        accepted = ("S", "QUIT") if command == "CTL" and value == "S" else (value,)
+        deadline = time.monotonic() + self.transport.settings.timeout_s
+        while True:
+            reported = self._read_choice(command, choices)
+            if reported in accepted:
+                return
+            # Poll a running transition only; S/QUIT are terminal Stop replies.
+            stopping = command == "CTL" and value == "S" and reported == "R"
+            remaining = deadline - time.monotonic()
+            if stopping and remaining > 0:
+                time.sleep(min(0.1, remaining))
+                if time.monotonic() < deadline:
+                    continue
+            raise ProtocolError(
+                f"{error}; last {command} readback was {reported!r}, expected one of {accepted!r}; "
+                "write was sent once and was not retried"
+            )
 
     def set_setpoint(self, target_c: float) -> float:
         """Set a Celsius target and return the confirmed target after device rounding.
 
         We transmit one decimal place in the device's display units. Verify against
         that transmitted value, converted back to Celsius, rather than the original
-        input. Both the input and rounded target must stay inside configured limits.
+        input. The device decides which target values it accepts.
         """
         target = finite_number(target_c, "Setpoint")
-        if not self.min_c <= target <= self.max_c:
-            raise ValueError(f"Setpoint must be {self.min_c:g} to {self.max_c:g} Celsius")
         with self._lock:
             units = self._read_choice("SCF", ("C", "F"))
             device_target = target if units == "C" else target * 1.8 + 32
+            device_target = finite_number(device_target, "Setpoint in device units")
             field = f"{device_target:.1f}"
             expected = float(field) if units == "C" else (float(field) - 32) / 1.8
-            if not self.min_c <= expected <= self.max_c:
-                raise ValueError("Rounded device setpoint would exceed the configured limits")
-            with self._verified_write("TSP", field):
-                reported = self.read_setpoint()
-                # Compare to the transmitted value, including C/F quantization.
-                if abs(reported - expected) > 0.001:
-                    raise ProtocolError(
-                        f"Setpoint readback mismatch: requested {target:g}, read {reported:g} C; "
-                        "write was not retried"
-                    )
+            self.transport.request("TSP", field)
+            reported = self.read_setpoint()
+            # Compare to the transmitted value, including C/F quantization.
+            if abs(reported - expected) > 0.001:
+                raise ProtocolError(
+                    f"Setpoint readback mismatch: requested {target:g}, read {reported:g} C; "
+                    "write was not retried"
+                )
             return reported
 
     def run(self):
-        """Check level, send Run once, and verify CTL=R; this does not prove flow."""
+        """Send Run once and verify CTL=R; the device decides whether it can run."""
         with self._lock:
-            if self._read_choice("LVL", ("OK", "LOW")) != "OK":
-                raise ValueError("Coolant level LOW; fill and prime at the chiller first")
             self._write_and_check_choice(
                 "CTL", "R", ("R", "S"), "Run readback did not confirm R; inspect the front panel"
             )
 
     def stop(self):
-        """Stop the control loop; does not claim to stop the pump or remove mains power."""
+        """Send Stop once and accept S/QUIT; does not imply pump-off or power removal."""
         with self._lock:
             self._write_and_check_choice(
-                "CTL", "S", ("R", "S"), "Stop readback did not confirm S; inspect the front panel"
+                "CTL",
+                "S",
+                ("R", "S", "QUIT"),
+                "Stop readback did not confirm S/QUIT; inspect the front panel",
             )
 
     def set_pump(self, on: bool):
-        """With the loop stopped, write/verify PMP; require level OK before ON."""
+        """Send the chosen pump state once and verify its readback, without prerequisites."""
         if type(on) is not bool:
             raise ValueError("Pump state must be a boolean")
         with self._lock:
-            if self._read_choice("CTL", ("R", "S")) != "S":
-                raise ValueError("Stop the control loop before changing the pump")
-            if on and self._read_choice("LVL", ("OK", "LOW")) != "OK":
-                raise ValueError("Coolant level LOW; do not run the pump dry")
             self._write_and_check_choice(
                 "PMP",
                 "ON" if on else "OFF",
@@ -526,26 +497,28 @@ class Chiller:
         if not re.fullmatch(pattern, value):
             raise ValueError("Time must be HH:MM:SS, 00:00:00 to 23:59:59")
         with self._lock:
+            if self.identity is None:
+                raise RuntimeError("Connect first")
             started = time.monotonic()
-            with self._verified_write("TIM", value):
-                reported = self.query("TIM")
-                read_pattern = r"(?:[01]?\d|2[0-3]):[0-5]?\d:[0-5]?\d"
-                if not re.fullmatch(read_pattern, reported):
-                    raise ProtocolError(f"TIM: invalid time readback {reported!r}")
-                reported = ":".join(f"{int(field):02d}" for field in reported.split(":"))
+            self.transport.request("TIM", value)
+            reported = self.query("TIM")
+            read_pattern = r"(?:[01]?\d|2[0-3]):[0-5]?\d:[0-5]?\d"
+            if not re.fullmatch(read_pattern, reported):
+                raise ProtocolError(f"TIM: invalid time readback {reported!r}")
+            reported = ":".join(f"{int(field):02d}" for field in reported.split(":"))
 
-                def seconds_since_midnight(text):
-                    hours, minutes, seconds_ = map(int, text.split(":"))
-                    return hours * 3600 + minutes * 60 + seconds_
+            def seconds_since_midnight(text):
+                hours, minutes, seconds_ = map(int, text.split(":"))
+                return hours * 3600 + minutes * 60 + seconds_
 
-                elapsed = time.monotonic() - started
-                advance = (seconds_since_midnight(reported) - seconds_since_midnight(value)) % 86400
-                # A running clock can advance, including across midnight.
-                if advance > math.ceil(elapsed) + 1:
-                    raise ProtocolError(
-                        f"Time readback mismatch: requested {value}, read {reported}; "
-                        "write was not retried"
-                    )
+            elapsed = time.monotonic() - started
+            advance = (seconds_since_midnight(reported) - seconds_since_midnight(value)) % 86400
+            # A running clock can advance, including across midnight.
+            if advance > math.ceil(elapsed) + 1:
+                raise ProtocolError(
+                    f"Time readback mismatch: requested {value}, read {reported}; "
+                    "write was not retried"
+                )
             return reported
 
 
@@ -598,13 +571,13 @@ class CsvRecorder:
         self.close()
 
 
-def create_chiller(config_path=None, *, simulate=False, port=None, allow_writes=False):
+def create_chiller(config_path=None, *, simulate=False, port=None):
     """Build a controller without connecting; use its with block or call connect().
 
     config_path optionally names a TOML file with [serial] and [control] sections.
-    port overrides its port/USB adapter selection. allow_writes=True enables writes
-    even if disabled in the file. simulate=True uses memory instead of hardware.
-    Defaults are read-only; hardware also needs a port or USB adapter selection.
+    port overrides its port/USB adapter selection. simulate=True uses memory
+    instead of hardware. All control methods are available after connection;
+    hardware needs a port or USB adapter selection.
     """
     config = {}
     if config_path is not None:
@@ -615,16 +588,18 @@ def create_chiller(config_path=None, *, simulate=False, port=None, allow_writes=
         raise ValueError(f"Unknown configuration sections: {sorted(unknown)}")
     serial_config = dict(config.get("serial", {}))
     control = dict(config.get("control", {}))
-    if set(control) - {"allow_writes", "min_c", "max_c", "expected_serial_number"}:
-        raise ValueError("Unknown control setting")
+    unknown_control = set(control) - {"expected_serial_number"}
+    if unknown_control:
+        raise ValueError(
+            f"Unknown control settings: {sorted(unknown_control)}; "
+            "only expected_serial_number is supported"
+        )
     if port is not None:
         serial_config["port"] = port
         serial_config.pop("usb_serial_number", None)
     if simulate:
         serial_config["port"] = "SIMULATOR"
     settings = SerialSettings(**serial_config)
-    if allow_writes:
-        control["allow_writes"] = True
     if simulate:
         # Simulator imports this module's transport; import it here to avoid a cycle.
         from .simulator import Simulator
