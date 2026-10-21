@@ -87,7 +87,7 @@ def test_captured_running_substates_block_pump_only_changes(reply):
 def test_unverified_running_diagnostic_is_rejected():
     device, _ = scripted_device("$PCCTL=Running... unknown diagnostic")
     with device, pytest.raises(ProtocolError):
-        device._choice("CTL", ("R", "S"))
+        device._read_choice("CTL", ("R", "S"))
 
 
 def test_stop_polls_running_transition_without_replaying_write():

@@ -7,10 +7,8 @@ from dataclasses import replace
 import pytest
 
 from tark_nrc import Chiller, CommunicationError, Simulator
-from tark_nrc.__main__ import main
-from tark_nrc.config import create_chiller
-from tark_nrc.gui import DashboardSession, create_app
-from tark_nrc.recording import CsvRecorder
+from tark_nrc.controller import CsvRecorder, create_chiller
+from tark_nrc.gui import DashboardSession, create_app, main
 
 
 def test_cli_simulator_read(capsys):
@@ -27,6 +25,27 @@ def test_cli_requires_backend_and_write_permission(capsys):
     assert main(["--simulate", "set", "22"]) == 1
     assert "Writes disabled" in capsys.readouterr().out
     assert main(["--simulate", "--allow-writes", "set", "22"]) == 0
+
+
+@pytest.mark.parametrize(
+    "failure,exit_code", [(RuntimeError("Lost link"), 1), (KeyboardInterrupt(), 0)]
+)
+def test_cli_closes_connection_after_command_failure_or_interrupt(monkeypatch, failure, exit_code):
+    import tark_nrc.gui as gui
+
+    device = create_chiller(simulate=True)
+    sent = []
+
+    def fail_command(chiller, args):
+        assert chiller.identity is not None
+        sent.extend(chiller.transport._serial.commands)
+        raise failure
+
+    monkeypatch.setattr(gui, "create_chiller", lambda *args, **kwargs: device)
+    monkeypatch.setattr(gui, "execute_command", fail_command)
+    assert main(["--simulate", "read"]) == exit_code
+    assert device.identity is None and device.transport._serial is None
+    assert sent == [b"$PCMOD\r\n", b"$PCSSN\r\n", b"$PCVER\r\n"]
 
 
 def test_csv_end_to_end_and_existing_file_preserved(tmp_path):
@@ -63,6 +82,17 @@ def test_config_hardware_does_not_silently_use_simulator(tmp_path):
     assert device.transport.settings.port == "COM9999"
     assert not device.allow_writes
     assert device.transport._serial is None
+
+
+def test_config_loads_usb_binding_and_explicit_port_overrides_it(tmp_path):
+    path = tmp_path / "adapter.toml"
+    path.write_text('[serial]\nport="COM10"\nusb_serial_number="FTB8VKKUA"\n')
+    device = create_chiller(path)
+    assert device.transport.settings.usb_serial_number == "FTB8VKKUA"
+    assert device.transport._serial is None
+    override = create_chiller(path, port="COM9")
+    assert override.transport.settings.port == "COM9"
+    assert override.transport.settings.usb_serial_number is None
 
 
 def test_dashboard_actions_invalid_input_and_failure(tmp_path, monkeypatch):
@@ -115,6 +145,14 @@ def test_dash_routes_layout_and_packaged_style():
 
 def refresh_dashboard(app, target=None, previous_target=None, action="poll", changed=None):
     """Exercise the real Dash callback dispatch, with a software-test backend."""
+    payload = dashboard_payload(app, target, previous_target, action, changed)
+    response = app.server.test_client().post("/_dash-update-component", json=payload)
+    assert response.status_code == 200
+    return response.get_json()["response"]
+
+
+def dashboard_payload(app, target=None, previous_target=None, action="poll", changed=None):
+    """Construct a callback request for either the test client or a live local server."""
     key, callback = next(iter(app.callback_map.items()))
     outputs = [
         {"id": output.component_id, "property": output.component_property}
@@ -128,22 +166,17 @@ def refresh_dashboard(app, target=None, previous_target=None, action="poll", cha
         }
         for item in callback["inputs"]
     ]
-    response = app.server.test_client().post(
-        "/_dash-update-component",
-        json={
-            "output": key,
-            "outputs": outputs,
-            "inputs": inputs,
-            "state": [
-                {"id": "target", "property": "value", "value": target},
-                {"id": "reported-target", "property": "data", "value": previous_target},
-            ],
-            "changedPropIds": changed
-            or [f"{action}.{'n_intervals' if action == 'poll' else 'n_clicks'}"],
-        },
-    )
-    assert response.status_code == 200
-    return response.get_json()["response"]
+    return {
+        "output": key,
+        "outputs": outputs,
+        "inputs": inputs,
+        "state": [
+            {"id": "target", "property": "value", "value": target},
+            {"id": "reported-target", "property": "data", "value": previous_target},
+        ],
+        "changedPropIds": changed
+        or [f"{action}.{'n_intervals' if action == 'poll' else 'n_clicks'}"],
+    }
 
 
 def test_dashboard_initializes_live_target_and_preserves_operator_edit():
@@ -351,3 +384,187 @@ def test_recovery_rejects_replaced_unit_even_without_configured_serial_binding(m
         assert "Recovery unit changed" in message
         assert device.identity is None
         assert not any(b"," in frame for frame in sent)
+
+
+def test_dashboard_waits_for_connect_and_opens_csv_after_identification(tmp_path):
+    device = Chiller(Simulator(), allow_writes=True)
+    path = tmp_path / "connected.csv"
+    app = create_app(device, csv_path=path)
+    try:
+        initial = refresh_dashboard(app, action="run")
+        assert device.identity is None and device.transport._serial is None
+        assert initial["poll"]["disabled"] and not initial["connect"]["disabled"]
+        assert all(initial[key]["disabled"] for key in ("set", "run", "stop", "pump-off"))
+        assert not path.exists()
+        connected = refresh_dashboard(app, changed=["connect.n_clicks", "run.n_clicks"])
+        assert not connected["poll"]["disabled"] and connected["connect"]["disabled"]
+        assert "SIMULATOR-0001" in connected["identity"]["children"]
+        assert connected["target"]["value"] == 20
+        assert not any(b"," in frame for frame in device.transport._serial.commands)
+        assert app.nrc_session.recorder.rows == 1
+    finally:
+        app.nrc_session.shutdown()
+    with path.open(newline="") as stream:
+        assert next(csv.DictReader(stream))["serial_number"] == "SIMULATOR-0001"
+
+
+def test_connect_failure_can_retry_but_does_not_clear_runtime_fault(monkeypatch):
+    device = Chiller(Simulator(), allow_writes=True)
+    app = create_app(device)
+    connect = device.connect
+
+    def fail():
+        raise CommunicationError("Port unavailable")
+
+    monkeypatch.setattr(device, "connect", fail)
+    rejected = refresh_dashboard(app, action="connect")
+    assert "Connection failed" in rejected["notice"]["children"]
+    assert not rejected["connect"]["disabled"] and rejected["poll"]["disabled"]
+    monkeypatch.setattr(device, "connect", connect)
+    try:
+        refresh_dashboard(app, action="connect")
+        monkeypatch.setattr(device, "read_sample", fail)
+        refresh_dashboard(app)
+        serial = device.transport._serial
+        before = list(serial.commands)
+        locked = refresh_dashboard(app, action="connect")
+        assert app.nrc_session.failed and locked["connect"]["disabled"]
+        assert serial.commands == before
+    finally:
+        app.nrc_session.shutdown()
+
+
+def test_shutdown_closes_csv_and_port_without_control_writes(tmp_path):
+    device = Chiller(Simulator(), allow_writes=True)
+    app = create_app(device, csv_path=tmp_path / "shutdown.csv")
+    refresh_dashboard(app, action="connect")
+    refresh_dashboard(app, action="run")
+    serial = device.transport._serial
+    before = list(serial.commands)
+    stopped = refresh_dashboard(
+        app, changed=["poll.n_intervals", "shutdown.n_clicks", "stop.n_clicks"]
+    )
+    assert app.nrc_session.closed and device.identity is None
+    assert device.transport._serial is None and serial.commands == before
+    assert app.nrc_session.recorder._file.closed
+    assert stopped["poll"]["disabled"] and stopped["connect"]["disabled"]
+    assert stopped["shutdown"]["disabled"]
+    assert all(stopped[key]["disabled"] for key in ("target", "run", "stop", "pump-off"))
+    refresh_dashboard(app, action="connect")
+    refresh_dashboard(app, action="stop")
+    assert device.identity is None and serial.commands == before
+
+
+def test_shutdown_before_connect_does_not_open_device_or_csv(tmp_path):
+    device = Chiller(Simulator())
+    path = tmp_path / "unused.csv"
+    app = create_app(device, csv_path=path)
+    result = refresh_dashboard(app, action="shutdown")
+    assert result["shutdown"]["disabled"]
+    assert device.transport._serial is None and not path.exists()
+
+
+def test_cli_gui_defers_connect_until_operator_request(monkeypatch):
+    import tark_nrc.gui as gui
+
+    def serve(device, **kwargs):
+        assert device.identity is None and device.transport._serial is None
+        assert kwargs["csv_path"] == "outputs/deferred.csv"
+
+    monkeypatch.setattr(gui, "run_dashboard", serve)
+    assert main(["--simulate", "gui", "--csv", "outputs/deferred.csv"]) == 0
+
+
+@pytest.mark.parametrize(
+    "filename,args", [("config.toml", ["gui"]), ("other.toml", ["--config", "other.toml", "gui"])]
+)
+def test_cli_gui_loads_local_config_without_opening_port(tmp_path, monkeypatch, filename, args):
+    import tark_nrc.gui as gui
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / filename).write_text(
+        '[serial]\nport="COM9999"\n[control]\nallow_writes=false\nmin_c=12\nmax_c=20\n'
+    )
+    seen = []
+
+    def serve(device, **kwargs):
+        seen.append(device)
+        assert device.transport.backend == "hardware"
+        assert device.transport.settings.port == "COM9999"
+        assert not device.allow_writes
+        assert (device.min_c, device.max_c) == (12, 20)
+        assert device.identity is None and device.transport._serial is None
+
+    monkeypatch.setattr(gui, "run_dashboard", serve)
+    assert main(args) == 0
+    assert len(seen) == 1
+
+
+def test_cli_gui_missing_default_config_reports_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert main(["gui"]) == 1
+    assert "config.toml" in capsys.readouterr().out
+
+
+def test_gui_shutdown_returns_http_response_and_stops_real_server(monkeypatch):
+    from threading import Event, Thread
+    from urllib.request import Request, urlopen
+
+    import werkzeug.serving
+
+    import tark_nrc.gui as gui
+
+    ready = Event()
+    captured = {}
+    make_server = werkzeug.serving.make_server
+    create = gui.create_app
+
+    def capture_app(*args, **kwargs):
+        app = create(*args, **kwargs)
+        captured["app"] = app
+        return app
+
+    def capture_server(*args, **kwargs):
+        server = make_server(*args, **kwargs)
+        captured["server"] = server
+        ready.set()
+        return server
+
+    monkeypatch.setattr(gui, "create_app", capture_app)
+    monkeypatch.setattr(werkzeug.serving, "make_server", capture_server)
+    device = Chiller(Simulator())
+    errors = []
+
+    def serve():
+        try:
+            gui.run_dashboard(device, port=0)
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        assert ready.wait(5), errors
+        url = f"http://127.0.0.1:{captured['server'].server_port}"
+        with urlopen(url, timeout=5) as response:
+            assert response.status == 200
+        for action in ("connect", "shutdown"):
+            payload = dashboard_payload(captured["app"], action=action)
+            request = Request(
+                url + "/_dash-update-component",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urlopen(request, timeout=5) as response:
+                result = json.load(response)["response"]
+            if action == "connect":
+                assert not result["poll"]["disabled"]
+            else:
+                assert "GUI shut down" in result["notice"]["children"]
+        thread.join(5)
+        assert not thread.is_alive() and not errors
+        assert device.identity is None and captured["app"].nrc_session.closed
+    finally:
+        if thread.is_alive() and "server" in captured:
+            Thread(target=captured["server"].shutdown, daemon=True).start()
+            thread.join(5)

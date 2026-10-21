@@ -1,6 +1,9 @@
 # Copy to config.toml and enter the verified OS port. See docs/commissioning.md.
 [serial]
 port = ""  # Enter the verified port; examples are not device identification.
+# US232R-10-BULK uses the FTDI virtual COM port driver (115200 8N1, no flow control).
+# Optional exact USB adapter binding; follows COM renumbering and never probes other ports.
+# usb_serial_number = ""  # Copy the selected adapter's serial from `uv run tark-nrc ports`.
 timeout_s = 1.0
 # CRLF and a one-line write reply are assumptions, not specified in manual Rev 02.
 line_ending = "crlf"  # cr, lf or crlf

@@ -12,6 +12,18 @@ RS-232 adapter supporting 115200 8N1 and a vendor-confirmed DB-9 cable. RS-485/T
 are incompatible. Obtain the pinout and straight-through/null-modem requirement;
 the manual does not establish these. See electrical requirements in sections 3/10.
 
+An example RS-232 adapter is the
+[FTDI US232R-10-BULK](https://ftdichip.com/products/us232r-10-bulk/), a USB-to-RS232
+adapter with a virtual COM port driver. Keep the NRC400's 115200 8N1/no-flow-control
+settings; the adapter swap does not change the chiller command protocol.
+`uv run tark-nrc ports` lists USB adapter serial numbers without opening ports.
+Optionally set `serial.usb_serial_number` to the selected adapter's exact serial;
+Connect resolves its current port and rejects missing or duplicate matches before
+opening anything. With no USB binding, `serial.port` is used directly. An explicit
+CLI `--port` overrides the USB binding. Keep the separate chiller serial-number
+binding to verify the unit attached to the adapter. Recheck identity/readbacks and
+cabling after a swap; the 2026-10-14 hardware evidence applies to that session's adapter.
+
 Match coolant, hose materials and mating connectors to the application/part number;
 pages 22–24 distinguish standard/special connectors. Keep the unit level, meet
 Figure 5's airflow clearance (p21), leave ports/power accessible and avoid hose bends.

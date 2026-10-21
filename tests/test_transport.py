@@ -1,11 +1,12 @@
 """Literal byte framing and failure tests using an offline serial peer."""
 
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from tark_nrc import CommunicationError, SerialSettings, SerialTransport
-from tark_nrc.transport import encode_command
+from tark_nrc.controller import encode_command
 
 
 class SerialPeer:
@@ -120,6 +121,68 @@ def test_actual_serial_open_parameters_and_lazy_construction():
     assert not any(settings[k] for k in ["xonxoff", "rtscts", "dsrdtr"])
 
 
+def test_usb_adapter_binding_follows_com_number_without_opening_other_adapters(monkeypatch):
+    from serial.tools import list_ports
+
+    ports = [
+        SimpleNamespace(device="COM9", serial_number="OTHER-ADAPTER"),
+        SimpleNamespace(device="COM12", serial_number="FTB8VKKUA"),
+    ]
+    monkeypatch.setattr(list_ports, "comports", lambda: ports)
+    calls = []
+    link = SerialTransport(
+        SerialSettings(port="COM10", usb_serial_number="FTB8VKKUA"),
+        lambda **kw: calls.append(kw) or SerialPeer(b""),
+    )
+    assert not calls and link.port is None
+    link.open()
+    assert len(calls) == 1 and calls[0]["port"] == "COM12"
+    assert calls[0]["baudrate"] == 115200
+    assert not any(calls[0][key] for key in ("xonxoff", "rtscts", "dsrdtr"))
+    assert link.port == "COM12"
+    link.close()
+    assert link.port is None
+    ports[1].device = "COM14"
+    link.open()
+    assert calls[-1]["port"] == "COM14"
+    link.close()
+
+
+@pytest.mark.parametrize("count", [0, 2])
+def test_missing_or_ambiguous_usb_adapter_never_falls_back_to_configured_port(monkeypatch, count):
+    from serial.tools import list_ports
+
+    monkeypatch.setattr(
+        list_ports,
+        "comports",
+        lambda: [
+            SimpleNamespace(device=f"COM{index}", serial_number="BOUND") for index in range(count)
+        ],
+    )
+    calls = []
+    link = SerialTransport(
+        SerialSettings(port="COM10", usb_serial_number="BOUND"),
+        lambda **kw: calls.append(kw),
+    )
+    with pytest.raises(CommunicationError, match=f"found {count}"):
+        link.open()
+    assert not calls and link.port is None
+
+
+def test_simulation_ignores_physical_usb_adapter_binding(monkeypatch):
+    from serial.tools import list_ports
+
+    from tark_nrc import Chiller, Simulator
+
+    def forbidden():
+        pytest.fail("Simulator must not enumerate physical USB adapters")
+
+    monkeypatch.setattr(list_ports, "comports", forbidden)
+    with Chiller(Simulator(SerialSettings(port="COM10", usb_serial_number="BOUND"))) as device:
+        assert device.identity.serial_number == "SIMULATOR-0001"
+        assert device.transport.port == "SIMULATOR"
+
+
 def test_partial_serial_write_is_failure(monkeypatch):
     link, peer = link_for(b"20.0\n")
     monkeypatch.setattr(peer, "write", lambda payload: 2)
@@ -133,6 +196,10 @@ def test_partial_serial_write_is_failure(monkeypatch):
         {"port": True},
         {"port": 7},
         {"port": None},
+        {"usb_serial_number": ""},
+        {"usb_serial_number": "  "},
+        {"usb_serial_number": True},
+        {"usb_serial_number": 123},
         {"timeout_s": True},
         {"write_delay_s": False},
     ],
